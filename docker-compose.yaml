@@ -1,0 +1,26 @@
+services:
+  bluemap-minimap:
+    build: .
+    restart: always
+    environment:
+      BLUEMAP_BASE_URL: "http://bluemap.example.com:9332"
+      BLUEMAP_MAP_ID: "world"
+      BLUEMAP_CACHE_DIR: "/cache"
+      BLUEMAP_TIMEOUT_SECONDS: "10"
+    command: ["gunicorn", "--bind", "0.0.0.0:5055", "--workers", "1", "--threads", "2", "--timeout", "30", "app:app"]
+    mem_limit: 96m
+    memswap_limit: 96m
+    ports:
+      - "5055:5055"
+    volumes:
+      - bluemap-minimap-cache:/cache
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  bluemap-minimap-cache:
