@@ -79,6 +79,10 @@ def create_app() -> Flask:
         except RequestException as error:
             return jsonify({"error": f"BlueMap request failed: {error}"}), 502
 
+    @app.get("/minimap.lua")
+    def minimap_lua():
+        return send_file("/app/computercraft/minimap.lua", mimetype="text/plain; charset=utf-8")
+
     return app
 
 
