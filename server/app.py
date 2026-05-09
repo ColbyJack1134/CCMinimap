@@ -52,7 +52,6 @@ def create_app() -> Flask:
                     "h": image.height,
                     "x": frame_request.x,
                     "z": frame_request.z,
-                    "heading": frame_request.heading,
                     "rows": rows,
                 }
             )

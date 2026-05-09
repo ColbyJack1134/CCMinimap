@@ -4,7 +4,6 @@ local REFRESH_SECONDS = 1.0
 local state = {
   bpp = 4,
   lod = 1,
-  rotate = false,
   lastX = nil,
   lastZ = nil,
   heading = 0,
@@ -15,8 +14,8 @@ local state = {
 local buttons = {}
 
 local function findMonitor()
-  local monitor = peripheral.find("monitor")
-  if monitor then return monitor end
+  local m = peripheral.find("monitor")
+  if m then return m end
   return term.current()
 end
 
@@ -51,13 +50,10 @@ local function buildUrl(x, z)
   local params = {
     "x=" .. urlencode(math.floor(x * 10) / 10),
     "z=" .. urlencode(math.floor(z * 10) / 10),
-    "heading=" .. urlencode(math.floor(state.heading * 10) / 10),
     "w=" .. urlencode(width),
     "h=" .. urlencode(mapHeight),
     "bpp=" .. urlencode(state.bpp),
     "lod=" .. urlencode(state.lod),
-    "rotate=" .. (state.rotate and "1" or "0"),
-    "marker=1",
   }
   return SERVER .. "/frame?" .. table.concat(params, "&")
 end
@@ -88,37 +84,25 @@ end
 
 local function drawRows(rows)
   local mapHeight = math.min(#rows, height - 2)
-  local text = string.rep(" ", width)
-  local fg = string.rep("0", width)
-
   for y = 1, mapHeight do
     local row = rows[y]
-    if row and #row >= width then
+    if row then
       monitor.setCursorPos(1, y)
-      monitor.blit(text, fg, row:sub(1, width))
+      monitor.blit(string.rep(" ", #row), string.rep("0", #row), row)
     end
   end
 end
 
 local function drawOsd(x, y, z)
-  local footerY = height - 1
-  local controlsY = height
-  monitor.setBackgroundColor(colors.black)
-  monitor.setTextColor(colors.white)
-  monitor.setCursorPos(1, footerY)
-  monitor.clearLine()
-  monitor.setCursorPos(1, controlsY)
-  monitor.clearLine()
-
+  local controlsY = height - 1
+  local footerY = height
   local coord = string.format("X:%d Y:%d Z:%d H:%03d", x, y or 0, z, state.heading)
   drawText(1, footerY, coord:sub(1, width), colors.white, colors.black)
-
   buttons = {}
   drawButton("zoom_in", 1, controlsY, " + ")
   drawButton("zoom_out", 5, controlsY, " - ")
-  drawButton("rotate", 9, controlsY, state.rotate and "ROT" or "NUP")
-  drawButton("lod", 14, controlsY, "L" .. state.lod)
-  drawText(18, controlsY, ("bpp:%s %s"):format(state.bpp, state.status):sub(1, width - 17), colors.lightGray, colors.black)
+  drawButton("lod", 9, controlsY, "L" .. state.lod)
+  drawText(13, controlsY, (("bpp:%s %s"):format(state.bpp, state.status)):sub(1, math.max(1, width - 12)), colors.lightGray, colors.black)
 end
 
 local function drawError(message)
@@ -130,25 +114,20 @@ local function drawError(message)
 end
 
 local function fetchFrame(x, y, z)
-  local response, err = http.get(buildUrl(x, z), {
-    ["accept"] = "application/json",
-  })
+  local response, err = http.get(buildUrl(x, z), { ["accept"] = "application/json" })
   if not response then
     state.status = "http failed"
     drawError(err or "http.get failed")
     return
   end
-
   local body = response.readAll()
   response.close()
-
   local data = textutils.unserializeJSON(body)
   if not data or not data.rows then
     state.status = "bad json"
     drawError(body)
     return
   end
-
   state.status = "ok"
   drawRows(data.rows)
   drawOsd(math.floor(x), math.floor(y or 0), math.floor(z))
@@ -175,8 +154,6 @@ local function handleTouch(_, side, x, y)
         state.bpp = clamp(state.bpp / 2, 0.5, 128)
       elseif id == "zoom_out" then
         state.bpp = clamp(state.bpp * 2, 0.5, 128)
-      elseif id == "rotate" then
-        state.rotate = not state.rotate
       elseif id == "lod" then
         state.lod = state.lod + 1
         if state.lod > 3 then state.lod = 1 end
