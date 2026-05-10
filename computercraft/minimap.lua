@@ -8,14 +8,13 @@ local SIDECAR_INTERVAL = 2.5
 
 local SUB_W, SUB_H = 2, 3
 
--- 3-wide x 2-tall cell stencils (6x6 sub-pixels), ordered for compass heading
--- 1=N (heading 0), 2=E (90), 3=S (180), 4=W (270)
-local TRIANGLE_STENCILS = {
-  { 0x38, 0x3F, 0x34, 0x00, 0x3F, 0x00 }, -- N up
-  { 0x30, 0x38, 0x3D, 0x03, 0x0B, 0x1F }, -- E right
-  { 0x00, 0x3F, 0x00, 0x0B, 0x3F, 0x07 }, -- S down
-  { 0x3E, 0x34, 0x30, 0x2F, 0x07, 0x03 }, -- W left
-}
+-- Rasterized needle config: thin line drawn from the center cell out in the
+-- compass-heading direction. Length is in sub-pixels; area is the cell
+-- bounding box that gets re-blitted each tick (so old needle positions are
+-- restored from cache instead of leaving a trail).
+local NEEDLE_LENGTH_SUB = 5
+local NEEDLE_AREA_W = 7
+local NEEDLE_AREA_H = 5
 
 -- 2-cell rounded blob for player markers; cells fully replaced with color+black.
 local PLAYER_MARKER = { 0x2E, 0x1D }
@@ -166,10 +165,8 @@ local function worldToCell(wx, wz, cx, cz, mapH)
   return col, row
 end
 
--- Quantize a compass heading (0=N, 90=E, ...) to one of 4 stencils 1..4
-local function directionForHeading(h)
-  return math.floor((((h or 0) % 360) / 90) + 0.5) % 4 + 1
-end
+-- (directionForHeading was only used by the stencil arrow; the needle uses the
+-- raw heading directly.)
 
 -- Convert MC yaw (0=S) to compass heading (0=N)
 local function compassFromMcYaw(yaw)
@@ -208,15 +205,45 @@ local function overlayCell(col, row, stenBits, color, mapH, override)
 end
 
 local function overlaySelfTriangle(heading, mapH)
-  local stencil = TRIANGLE_STENCILS[directionForHeading(heading)]
-  if not stencil then return end
+  local rad = math.rad(heading or 0)
+  local dx = math.sin(rad)
+  local dy = -math.cos(rad)  -- compass 0 = N = up = -Y on screen
+
   local centerCol = math.floor(width / 2 + 0.5)
   local centerRow = math.floor(mapH / 2 + 0.5)
-  local startCol = centerCol - 1
-  local startRow = centerRow - 1
-  for sr = 0, 1 do
-    for sc = 0, 2 do
-      overlayCell(startCol + sc, startRow + sr, stencil[sr * 3 + sc + 1], "0", mapH, true)
+  -- Sub-pixel coordinate of the center cells geometric center
+  local centerSubX = (centerCol - 1) * SUB_W + (SUB_W - 1) / 2
+  local centerSubY = (centerRow - 1) * SUB_H + (SUB_H - 1) / 2
+
+  -- Walk the needle in fine steps, mark each sub-pixel into a per-cell bitmap.
+  local cells = {}
+  local steps = NEEDLE_LENGTH_SUB * 5
+  for i = 0, steps do
+    local t = i / steps
+    local sxAbs = centerSubX + dx * NEEDLE_LENGTH_SUB * t
+    local syAbs = centerSubY + dy * NEEDLE_LENGTH_SUB * t
+    local sxR = math.floor(sxAbs + 0.5)
+    local syR = math.floor(syAbs + 0.5)
+    local col = math.floor(sxR / SUB_W) + 1
+    local row = math.floor(syR / SUB_H) + 1
+    local sx = sxR - (col - 1) * SUB_W
+    local sy = syR - (row - 1) * SUB_H
+    if sx >= 0 and sx < SUB_W and sy >= 0 and sy < SUB_H then
+      local key = col * 1024 + row
+      cells[key] = bit32.bor(cells[key] or 0, bit32.lshift(1, sy * SUB_W + sx))
+    end
+  end
+
+  -- Re-blit the area around the center: cells on the needle get the stencil
+  -- bits, the rest restore from cache (overlayCell with stenBits=0 path).
+  local startCol = centerCol - math.floor(NEEDLE_AREA_W / 2)
+  local startRow = centerRow - math.floor(NEEDLE_AREA_H / 2)
+  for r = 0, NEEDLE_AREA_H - 1 do
+    for c = 0, NEEDLE_AREA_W - 1 do
+      local col = startCol + c
+      local row = startRow + r
+      local key = col * 1024 + row
+      overlayCell(col, row, cells[key] or 0, "0", mapH, true)
     end
   end
 end
