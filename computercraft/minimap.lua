@@ -8,14 +8,13 @@ local SIDECAR_INTERVAL = 2.5
 
 local SUB_W, SUB_H = 2, 3
 
--- 4-wide x 3-tall cell stencils (8x9 sub-pixels), ordered for compass heading
+-- 3-wide x 2-tall cell stencils (6x6 sub-pixels), ordered for compass heading
 -- 1=N (heading 0), 2=E (90), 3=S (180), 4=W (270)
--- Layout per stencil: row-major, cells (0,0) (1,0) (2,0) (3,0) (0,1) (1,1) ... (3,2)
 local TRIANGLE_STENCILS = {
-  { 0x20, 0x3E, 0x3D, 0x10, 0x03, 0x2B, 0x17, 0x03, 0x00, 0x2A, 0x15, 0x00 }, -- N up
-  { 0x00, 0x00, 0x38, 0x3D, 0x0C, 0x0C, 0x3F, 0x3F, 0x00, 0x00, 0x0B, 0x1F }, -- E right
-  { 0x00, 0x2A, 0x15, 0x00, 0x30, 0x3A, 0x35, 0x30, 0x02, 0x2F, 0x1F, 0x01 }, -- S down
-  { 0x3E, 0x34, 0x00, 0x00, 0x3F, 0x3F, 0x0C, 0x0C, 0x2F, 0x07, 0x00, 0x00 }, -- W left
+  { 0x38, 0x3F, 0x34, 0x00, 0x3F, 0x00 }, -- N up
+  { 0x30, 0x38, 0x3D, 0x03, 0x0B, 0x1F }, -- E right
+  { 0x00, 0x3F, 0x00, 0x0B, 0x3F, 0x07 }, -- S down
+  { 0x3E, 0x34, 0x30, 0x2F, 0x07, 0x03 }, -- W left
 }
 
 -- 2-cell rounded blob for player markers; cells fully replaced with color+black.
@@ -213,11 +212,11 @@ local function overlaySelfTriangle(heading, mapH)
   if not stencil then return end
   local centerCol = math.floor(width / 2 + 0.5)
   local centerRow = math.floor(mapH / 2 + 0.5)
-  local startCol = centerCol - 2
+  local startCol = centerCol - 1
   local startRow = centerRow - 1
-  for sr = 0, 2 do
-    for sc = 0, 3 do
-      overlayCell(startCol + sc, startRow + sr, stencil[sr * 4 + sc + 1], "0", mapH, true)
+  for sr = 0, 1 do
+    for sc = 0, 2 do
+      overlayCell(startCol + sc, startRow + sr, stencil[sr * 3 + sc + 1], "0", mapH, true)
     end
   end
 end
