@@ -3,7 +3,7 @@ local REFRESH_SECONDS = 1.0
 
 local state = {
   bpp = 2,
-  lod = 1,
+  lod = 1,  -- auto-updated when bpp changes; tap L1/L2/L3 to override
   lastX = nil,
   lastZ = nil,
   heading = 0,
@@ -30,6 +30,12 @@ local function clamp(v, lo, hi)
   if v < lo then return lo end
   if v > hi then return hi end
   return v
+end
+
+local function pickLod(bpp)
+  if bpp <= 4 then return 1 end
+  if bpp <= 24 then return 2 end
+  return 3
 end
 
 local function urlencode(value)
@@ -180,8 +186,10 @@ local function handleTouch(_, side, x, y)
     if x >= btn.x1 and x <= btn.x2 and y >= btn.y1 and y <= btn.y2 then
       if id == "zoom_in" then
         state.bpp = clamp(state.bpp / 2, 0.25, 128)
+        state.lod = pickLod(state.bpp)
       elseif id == "zoom_out" then
         state.bpp = clamp(state.bpp * 2, 0.25, 128)
+        state.lod = pickLod(state.bpp)
       elseif id == "lod" then
         state.lod = state.lod + 1
         if state.lod > 3 then state.lod = 1 end

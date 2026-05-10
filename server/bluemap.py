@@ -118,7 +118,7 @@ class BlueMapClient:
         response.raise_for_status()
         content_type = response.headers.get("content-type", "")
         if "image/png" not in content_type:
-            raise BlueMapError(f"Unexpected tile content type: {content_type}")
+            return None
 
         image = Image.open(io.BytesIO(response.content)).convert("RGBA")
         image.save(cache_path)

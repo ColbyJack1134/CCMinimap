@@ -71,6 +71,15 @@ def render_subpixel_image(client: BlueMapClient, req: FrameRequest) -> Image.Ima
     crop_world_h = sub_h * req.blocks_per_pixel
     source_px_w = max(1, math.ceil(crop_world_w / lod_scale))
     source_px_h = max(1, math.ceil(crop_world_h / lod_scale))
+
+    SAFE_PIXELS = 4_000_000
+    if source_px_w * source_px_h > SAFE_PIXELS:
+        suggested = req.lod + 1 if req.lod < 3 else 3
+        raise ValueError(
+            f"frame too large at lod={req.lod} (would need "
+            f"{source_px_w}x{source_px_h} source pixels); try lod={suggested}"
+        )
+
     origin_x = req.x - crop_world_w / 2
     origin_z = req.z - crop_world_h / 2
 
@@ -107,7 +116,7 @@ def encode_blit(quant: Image.Image, cell_w: int, cell_h: int) -> tuple[list[str]
     """
     sub_w = cell_w * SUB_W
     sub_h = cell_h * SUB_H
-    pix = list(quant.getdata())
+    pix = [(i if i < 16 else 15) for i in quant.getdata()]
     assert len(pix) == sub_w * sub_h, f"size mismatch {len(pix)} vs {sub_w*sub_h}"
 
     text_rows: list[str] = []

@@ -42,7 +42,9 @@ def palette_image() -> Image.Image:
         flat: list[int] = []
         for c in MAP_PALETTE:
             flat.extend(c.rgb)
-        flat.extend([0] * (768 - len(flat)))
+        last = MAP_PALETTE[-1].rgb
+        while len(flat) < 768:
+            flat.extend(last)
         p.putpalette(flat)
         _PALETTE_IMAGE = p
     return _PALETTE_IMAGE
