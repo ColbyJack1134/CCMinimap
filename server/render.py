@@ -91,7 +91,7 @@ def render_subpixel_image(client: BlueMapClient, req: FrameRequest) -> Image.Ima
 
 def quantize_to_palette(image: Image.Image) -> Image.Image:
     """Floyd-Steinberg dither to MAP_PALETTE; returns 'P' image with indices 0-15."""
-    return image.convert("RGB").quantize(palette=palette_image(), dither=Image.Dither.FLOYDSTEINBERG)
+    return image.convert("RGB").quantize(palette=palette_image(), dither=Image.Dither.NONE)
 
 
 _PALETTE_RGB: tuple[tuple[int, int, int], ...] = tuple(c.rgb for c in MAP_PALETTE)
