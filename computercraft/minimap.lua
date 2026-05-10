@@ -40,6 +40,7 @@ local state = {
   sidecarAt = 0,
   lastFrame = nil,
   lastPos = nil,
+  lastError = nil,
 }
 local buttons = {}
 
@@ -271,10 +272,24 @@ local function drawOsd(x, y, z)
   drawButton("zoom_out", 5, osdY, " - ")
   drawButton("lod", 9, osdY, "L" .. state.lod)
   local headingStr = nav and tostring(math.floor((state.shipHeading or 0) + 0.5)) or "--"
-  local coord = string.format("X%d Z%d H%s B%s P%d",
-    x, z, headingStr, tostring(state.bpp), #(state.players or {}))
+  local pCount = #(state.players or {})
+  local pInfo = "P" .. pCount
+  if state.lastFrame and state.lastPos and state.players[1] and state.players[1].position then
+    local pp = state.players[1]
+    local mapH = math.max(3, height - 1)
+    local pcol, prow = worldToCell(pp.position.x, pp.position.z, state.lastPos.x, state.lastPos.z, mapH)
+    pInfo = pInfo .. ":" .. pcol .. "," .. prow
+  end
+  local coord = string.format("X%d Z%d H%s B%s %s",
+    x, z, headingStr, tostring(state.bpp), pInfo)
   local startCol = math.max(13, width - #coord + 1)
   drawText(startCol, osdY, coord:sub(1, width - startCol + 1), colors.white, colors.black)
+  if state.lastError then
+    monitor.setCursorPos(1, 1)
+    monitor.setTextColor(colors.red)
+    monitor.setBackgroundColor(colors.black)
+    monitor.write(state.lastError:sub(1, width))
+  end
 end
 
 local function drawError(message)
@@ -304,38 +319,48 @@ local function fullRedraw()
   drawOsd(math.floor(state.lastPos.x), math.floor(state.lastPos.y), math.floor(state.lastPos.z))
 end
 
+local function mapTick()
+  maybeFetchSidecar()
+  local x, y, z = gps.locate(0.5)
+  if x then
+    local data, err = httpGetJson(buildUrl(x, z))
+    if data and data.text then
+      state.status = "ok"
+      state.lastFrame = data
+      state.lastPos = { x = x, y = y or 0, z = z }
+      fullRedraw()
+    elseif data and data.error then
+      drawError(data.error)
+    else
+      drawError(err or "http.get failed")
+    end
+  else
+    drawError("No GPS lock")
+  end
+end
+
 local function mapLoop()
   while state.running do
-    maybeFetchSidecar()
-    local x, y, z = gps.locate(0.5)
-    if x then
-      local data, err = httpGetJson(buildUrl(x, z))
-      if data and data.text then
-        state.status = "ok"
-        state.lastFrame = data
-        state.lastPos = { x = x, y = y or 0, z = z }
-        fullRedraw()
-      elseif data and data.error then
-        drawError(data.error)
-      else
-        drawError(err or "http.get failed")
-      end
-    else
-      drawError("No GPS lock")
-    end
+    local ok, err = pcall(mapTick)
+    if not ok then state.lastError = tostring(err) end
     sleep(FRAME_INTERVAL)
+  end
+end
+
+local function fastTick()
+  local h = readHeading()
+  if h then state.shipHeading = h end
+  if state.lastFrame and state.lastPos then
+    local mapH = math.max(3, height - 1)
+    overlaySelfTriangle(state.shipHeading, mapH)
+    drawOsd(math.floor(state.lastPos.x), math.floor(state.lastPos.y), math.floor(state.lastPos.z))
   end
 end
 
 local function fastLoop()
   while state.running do
-    local h = readHeading()
-    if h then state.shipHeading = h end
-    if state.lastFrame and state.lastPos then
-      local mapH = math.max(3, height - 1)
-      overlaySelfTriangle(state.shipHeading, mapH)
-      drawOsd(math.floor(state.lastPos.x), math.floor(state.lastPos.y), math.floor(state.lastPos.z))
-    end
+    local ok, err = pcall(fastTick)
+    if not ok then state.lastError = tostring(err) end
     sleep(NAV_INTERVAL)
   end
 end
