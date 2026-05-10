@@ -124,6 +124,22 @@ class BlueMapClient:
         image.save(cache_path)
         return image
 
+    def live_markers(self) -> dict:
+        response = self.session.get(
+            f"{self.map_root}/live/markers.json",
+            timeout=self.config.timeout_seconds,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def live_players(self) -> dict:
+        response = self.session.get(
+            f"{self.map_root}/live/players.json",
+            timeout=self.config.timeout_seconds,
+        )
+        response.raise_for_status()
+        return response.json()
+
     def world_to_lowres_tile(self, x: float, z: float, lod: int) -> tuple[int, int, float, float, float]:
         lowres = self.lowres_settings()
         lod_scale = float(lowres.lod_factor ** (lod - 1))

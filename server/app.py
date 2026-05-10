@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import io
+import json
 import os
+import time
 
 from flask import Flask, jsonify, request, send_file
 from PIL import Image
@@ -84,6 +86,59 @@ def create_app() -> Flask:
             return jsonify({"error": str(error)}), 502
         except RequestException as error:
             return jsonify({"error": f"BlueMap request failed: {error}"}), 502
+
+
+    _players_cache = {"data": None, "ts": 0.0}
+    _PLAYERS_TTL = 1.0
+
+    @app.get("/players")
+    def players():
+        now = time.time()
+        if now - _players_cache["ts"] > _PLAYERS_TTL:
+            try:
+                _players_cache["data"] = client.live_players()
+                _players_cache["ts"] = now
+            except (RequestException, BlueMapError) as error:
+                return jsonify({"error": str(error)}), 502
+        return jsonify(_players_cache["data"] or {"players": []})
+
+    def _bm_marker_waypoints():
+        try:
+            sets = client.live_markers() or {}
+        except (RequestException, BlueMapError):
+            return []
+        out = []
+        for set_id, mset in sets.items():
+            if not isinstance(mset, dict):
+                continue
+            for marker_id, marker in (mset.get("markers") or {}).items():
+                pos = marker.get("position") or {}
+                if "x" in pos and "z" in pos:
+                    out.append({
+                        "name": marker.get("label") or marker_id,
+                        "x": pos["x"],
+                        "z": pos["z"],
+                        "color": marker.get("lineColor") or marker.get("fillColor") or "yellow",
+                        "source": "bluemap",
+                    })
+        return out
+
+    def _file_waypoints():
+        path = os.environ.get("WAYPOINTS_FILE", "/app/waypoints.json")
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return [dict(w, source="file") for w in data if isinstance(w, dict)]
+        except FileNotFoundError:
+            pass
+        except (json.JSONDecodeError, OSError):
+            return []
+        return []
+
+    @app.get("/waypoints")
+    def waypoints():
+        return jsonify(_file_waypoints() + _bm_marker_waypoints())
 
     @app.get("/minimap.lua")
     def minimap_lua():
