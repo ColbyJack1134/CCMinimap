@@ -6,7 +6,11 @@ from dataclasses import dataclass
 from PIL import Image
 
 from bluemap import BlueMapClient
-from cc_palette import nearest_code
+from cc_palette import MAP_PALETTE, palette_image
+
+
+SUB_W = 2
+SUB_H = 3
 
 
 @dataclass(frozen=True)
@@ -16,7 +20,7 @@ class FrameRequest:
     width: int = 80
     height: int = 48
     lod: int = 1
-    blocks_per_pixel: float = 4.0
+    blocks_per_pixel: float = 2.0  # blocks per *sub-pixel*
 
 
 def parse_frame_request(args) -> FrameRequest:
@@ -36,10 +40,10 @@ def parse_frame_request(args) -> FrameRequest:
     return FrameRequest(
         x=number("x", 0.0, -30_000_000, 30_000_000),
         z=number("z", 0.0, -30_000_000, 30_000_000),
-        width=integer("w", 80, 8, 240),
-        height=integer("h", 48, 8, 160),
+        width=integer("w", 80, 4, 240),
+        height=integer("h", 48, 3, 160),
         lod=integer("lod", 1, 1, 3),
-        blocks_per_pixel=number("bpp", 4.0, 0.5, 128.0),
+        blocks_per_pixel=number("bpp", 2.0, 0.25, 128.0),
     )
 
 
@@ -56,14 +60,15 @@ def _paste_tile(client, canvas, lod, tile_x, tile_z, origin_x, origin_z):
     canvas.alpha_composite(color_half, (px, py))
 
 
-def render_map_image(client: BlueMapClient, req: FrameRequest, scale: int = 1) -> Image.Image:
+def render_subpixel_image(client: BlueMapClient, req: FrameRequest) -> Image.Image:
+    """Returns RGB image at sub-pixel resolution: (width*2) x (height*3)."""
     lowres = client.lowres_settings()
     lod_scale = float(lowres.lod_factor ** (req.lod - 1))
-    out_w = req.width * scale
-    out_h = req.height * scale
+    sub_w = req.width * SUB_W
+    sub_h = req.height * SUB_H
 
-    crop_world_w = req.width * req.blocks_per_pixel
-    crop_world_h = req.height * req.blocks_per_pixel
+    crop_world_w = sub_w * req.blocks_per_pixel
+    crop_world_h = sub_h * req.blocks_per_pixel
     source_px_w = max(1, math.ceil(crop_world_w / lod_scale))
     source_px_h = max(1, math.ceil(crop_world_h / lod_scale))
     origin_x = req.x - crop_world_w / 2
@@ -76,22 +81,87 @@ def render_map_image(client: BlueMapClient, req: FrameRequest, scale: int = 1) -
     min_tile_z = math.floor(origin_z / tile_world)
     max_tile_z = math.floor((origin_z + crop_world_h) / tile_world)
 
-    for tile_z in range(min_tile_z, max_tile_z + 1):
-        for tile_x in range(min_tile_x, max_tile_x + 1):
-            _paste_tile(client, canvas, req.lod, tile_x, tile_z, origin_x, origin_z)
+    for tz in range(min_tile_z, max_tile_z + 1):
+        for tx in range(min_tile_x, max_tile_x + 1):
+            _paste_tile(client, canvas, req.lod, tx, tz, origin_x, origin_z)
 
     image = canvas.crop((0, 0, source_px_w, source_px_h)).convert("RGB")
-    image = image.resize((out_w, out_h), Image.Resampling.BILINEAR)
-    return image
+    return image.resize((sub_w, sub_h), Image.Resampling.BILINEAR)
 
 
-def image_to_cc_rows(image: Image.Image) -> list[str]:
-    rgb = image.convert("RGB")
-    pixels = rgb.load()
-    rows = []
-    for y in range(rgb.height):
-        row = []
-        for x in range(rgb.width):
-            row.append(nearest_code(pixels[x, y]))
-        rows.append("".join(row))
-    return rows
+def quantize_to_palette(image: Image.Image) -> Image.Image:
+    """Floyd-Steinberg dither to MAP_PALETTE; returns 'P' image with indices 0-15."""
+    return image.convert("RGB").quantize(palette=palette_image(), dither=Image.Dither.FLOYDSTEINBERG)
+
+
+_PALETTE_RGB: tuple[tuple[int, int, int], ...] = tuple(c.rgb for c in MAP_PALETTE)
+_HEX = "0123456789abcdef"
+
+
+def encode_blit(quant: Image.Image, cell_w: int, cell_h: int) -> tuple[list[str], list[str], list[str]]:
+    """Pack a (cell_w*2, cell_h*3) palette image into per-cell teletext blit triples.
+
+    Returns (text, fg, bg) — each a list of cell_h strings, cell_w bytes long.
+    text bytes are 0x40 + 5-bit pattern; the client adds 0x40 to recover the real
+    teletext char (0x80-0x9F). fg/bg use CC palette codes 0-f.
+    """
+    sub_w = cell_w * SUB_W
+    sub_h = cell_h * SUB_H
+    pix = list(quant.getdata())
+    assert len(pix) == sub_w * sub_h, f"size mismatch {len(pix)} vs {sub_w*sub_h}"
+
+    text_rows: list[str] = []
+    fg_rows: list[str] = []
+    bg_rows: list[str] = []
+
+    palette = _PALETTE_RGB
+    for cy in range(cell_h):
+        text_chars: list[str] = []
+        fg_chars: list[str] = []
+        bg_chars: list[str] = []
+        py0 = cy * SUB_H
+        row0 = py0 * sub_w
+        row1 = (py0 + 1) * sub_w
+        row2 = (py0 + 2) * sub_w
+        for cx in range(cell_w):
+            px0 = cx * SUB_W
+            cell = (
+                pix[row0 + px0], pix[row0 + px0 + 1],
+                pix[row1 + px0], pix[row1 + px0 + 1],
+                pix[row2 + px0], pix[row2 + px0 + 1],
+            )
+            counts: dict[int, int] = {}
+            for p in cell:
+                counts[p] = counts.get(p, 0) + 1
+            ranked = sorted(counts.keys(), key=lambda c: -counts[c])
+            bg = ranked[0]
+            fg = ranked[1] if len(ranked) > 1 else bg
+
+            if fg == bg:
+                pattern = 0
+            else:
+                fg_rgb = palette[fg]
+                bg_rgb = palette[bg]
+                pattern = 0
+                for i, p in enumerate(cell):
+                    if p == fg:
+                        pattern |= 1 << i
+                    elif p != bg:
+                        prgb = palette[p]
+                        d_fg = (prgb[0]-fg_rgb[0])**2 + (prgb[1]-fg_rgb[1])**2 + (prgb[2]-fg_rgb[2])**2
+                        d_bg = (prgb[0]-bg_rgb[0])**2 + (prgb[1]-bg_rgb[1])**2 + (prgb[2]-bg_rgb[2])**2
+                        if d_fg < d_bg:
+                            pattern |= 1 << i
+
+            if pattern & 0x20:
+                pattern ^= 0x3F
+                fg, bg = bg, fg
+
+            text_chars.append(chr(0x40 + pattern))
+            fg_chars.append(_HEX[fg])
+            bg_chars.append(_HEX[bg])
+        text_rows.append("".join(text_chars))
+        fg_rows.append("".join(fg_chars))
+        bg_rows.append("".join(bg_chars))
+
+    return text_rows, fg_rows, bg_rows

@@ -4,10 +4,12 @@ import io
 import os
 
 from flask import Flask, jsonify, request, send_file
+from PIL import Image
 from requests import RequestException
 
 from bluemap import BlueMapClient, BlueMapConfig, BlueMapError
-from render import image_to_cc_rows, parse_frame_request, render_map_image
+from cc_palette import MAP_PALETTE
+from render import encode_blit, parse_frame_request, quantize_to_palette, render_subpixel_image
 
 
 def create_app() -> Flask:
@@ -28,33 +30,34 @@ def create_app() -> Flask:
     def info():
         settings = client.settings()
         lowres = client.lowres_settings()
-        return jsonify(
-            {
-                "map": client.config.map_id,
-                "name": settings.get("name"),
-                "lowres": {
-                    "tileSize": lowres.tile_size,
-                    "lodFactor": lowres.lod_factor,
-                    "lodCount": lowres.lod_count,
-                },
-            }
-        )
+        return jsonify({
+            "map": client.config.map_id,
+            "name": settings.get("name"),
+            "lowres": {
+                "tileSize": lowres.tile_size,
+                "lodFactor": lowres.lod_factor,
+                "lodCount": lowres.lod_count,
+            },
+            "subpixel": {"w": 2, "h": 3},
+            "palette": [f"{c.rgb[0]:02X}{c.rgb[1]:02X}{c.rgb[2]:02X}" for c in MAP_PALETTE],
+        })
 
     @app.get("/frame")
     def frame():
         try:
-            frame_request = parse_frame_request(request.args)
-            image = render_map_image(client, frame_request)
-            rows = image_to_cc_rows(image)
-            return jsonify(
-                {
-                    "w": image.width,
-                    "h": image.height,
-                    "x": frame_request.x,
-                    "z": frame_request.z,
-                    "rows": rows,
-                }
-            )
+            req = parse_frame_request(request.args)
+            image = render_subpixel_image(client, req)
+            quant = quantize_to_palette(image)
+            text, fg, bg = encode_blit(quant, req.width, req.height)
+            return jsonify({
+                "w": req.width,
+                "h": req.height,
+                "x": req.x,
+                "z": req.z,
+                "text": text,
+                "fg": fg,
+                "bg": bg,
+            })
         except ValueError as error:
             return jsonify({"error": str(error)}), 400
         except BlueMapError as error:
@@ -65,11 +68,14 @@ def create_app() -> Flask:
     @app.get("/debug.png")
     def debug_png():
         try:
-            frame_request = parse_frame_request(request.args)
+            req = parse_frame_request(request.args)
             scale = max(1, min(8, int(request.args.get("scale", "4"))))
-            image = render_map_image(client, frame_request, scale=scale)
+            image = render_subpixel_image(client, req)
+            quant = quantize_to_palette(image)
+            rgb = quant.convert("RGB")
+            rgb = rgb.resize((rgb.width * scale, rgb.height * scale), Image.Resampling.NEAREST)
             buffer = io.BytesIO()
-            image.save(buffer, format="PNG")
+            rgb.save(buffer, format="PNG")
             buffer.seek(0)
             return send_file(buffer, mimetype="image/png")
         except ValueError as error:

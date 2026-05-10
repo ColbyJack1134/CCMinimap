@@ -2,7 +2,7 @@ local SERVER = "http://your-host.example.com:5055"
 local REFRESH_SECONDS = 1.0
 
 local state = {
-  bpp = 4,
+  bpp = 2,
   lod = 1,
   lastX = nil,
   lastZ = nil,
@@ -26,27 +26,49 @@ end
 local width, height = monitor.getSize()
 local unpackValues = table.unpack or unpack
 
-local function clamp(value, minValue, maxValue)
-  if value < minValue then return minValue end
-  if value > maxValue then return maxValue end
-  return value
+local function clamp(v, lo, hi)
+  if v < lo then return lo end
+  if v > hi then return hi end
+  return v
 end
 
 local function urlencode(value)
-  return tostring(value):gsub("([^%w%-_%.~])", function(char)
-    return string.format("%%%02X", string.byte(char))
+  return tostring(value):gsub("([^%w%-_%.~])", function(c)
+    return string.format("%%%02X", string.byte(c))
   end)
 end
 
 local function atan2(y, x)
-  if math.atan2 then
-    return math.atan2(y, x)
-  end
+  if math.atan2 then return math.atan2(y, x) end
   return math.atan(y, x)
 end
 
+local function httpGetJson(url)
+  local r, err = http.get(url, { ["accept"] = "application/json" })
+  if not r then return nil, err end
+  local body = r.readAll()
+  r.close()
+  return textutils.unserializeJSON(body), nil
+end
+
+local function applyPalette(palette)
+  if not palette then return end
+  for i = 1, math.min(#palette, 16) do
+    local hex = palette[i]
+    local n = tonumber(hex, 16)
+    if n then
+      monitor.setPaletteColor(2 ^ (i - 1), n)
+    end
+  end
+end
+
+local info = httpGetJson(SERVER .. "/info")
+if info and info.palette then
+  applyPalette(info.palette)
+end
+
 local function buildUrl(x, z)
-  local mapHeight = math.max(8, height - 2)
+  local mapHeight = math.max(3, height - 2)
   local params = {
     "x=" .. urlencode(math.floor(x * 10) / 10),
     "z=" .. urlencode(math.floor(z * 10) / 10),
@@ -82,14 +104,23 @@ local function updateHeading(x, z)
   state.lastZ = z
 end
 
-local function drawRows(rows)
-  local mapHeight = math.min(#rows, height - 2)
+-- Decode the wire text (bytes 0x40-0x5F) into actual teletext chars (0x80-0x9F).
+local function decodeTextRow(packed)
+  local out = {}
+  for i = 1, #packed do
+    out[i] = string.char(string.byte(packed, i) + 0x40)
+  end
+  return table.concat(out)
+end
+
+local function drawFrame(data)
+  local mapHeight = math.min(#data.text, height - 2)
   for y = 1, mapHeight do
-    local row = rows[y]
-    if row then
-      monitor.setCursorPos(1, y)
-      monitor.blit(string.rep(" ", #row), string.rep("0", #row), row)
-    end
+    local text = decodeTextRow(data.text[y])
+    local fg = data.fg[y]
+    local bg = data.bg[y]
+    monitor.setCursorPos(1, y)
+    monitor.blit(text, fg, bg)
   end
 end
 
@@ -114,22 +145,19 @@ local function drawError(message)
 end
 
 local function fetchFrame(x, y, z)
-  local response, err = http.get(buildUrl(x, z), { ["accept"] = "application/json" })
-  if not response then
+  local data, err = httpGetJson(buildUrl(x, z))
+  if not data then
     state.status = "http failed"
     drawError(err or "http.get failed")
     return
   end
-  local body = response.readAll()
-  response.close()
-  local data = textutils.unserializeJSON(body)
-  if not data or not data.rows then
+  if not data.text then
     state.status = "bad json"
-    drawError(body)
+    drawError(textutils.serialize(data):sub(1, width * 2))
     return
   end
   state.status = "ok"
-  drawRows(data.rows)
+  drawFrame(data)
   drawOsd(math.floor(x), math.floor(y or 0), math.floor(z))
 end
 
@@ -148,12 +176,12 @@ local function mapLoop()
 end
 
 local function handleTouch(_, side, x, y)
-  for id, button in pairs(buttons) do
-    if x >= button.x1 and x <= button.x2 and y >= button.y1 and y <= button.y2 then
+  for id, btn in pairs(buttons) do
+    if x >= btn.x1 and x <= btn.x2 and y >= btn.y1 and y <= btn.y2 then
       if id == "zoom_in" then
-        state.bpp = clamp(state.bpp / 2, 0.5, 128)
+        state.bpp = clamp(state.bpp / 2, 0.25, 128)
       elseif id == "zoom_out" then
-        state.bpp = clamp(state.bpp * 2, 0.5, 128)
+        state.bpp = clamp(state.bpp * 2, 0.25, 128)
       elseif id == "lod" then
         state.lod = state.lod + 1
         if state.lod > 3 then state.lod = 1 end

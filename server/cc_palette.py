@@ -1,8 +1,7 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
-from math import sqrt
-from typing import Iterable
+
+from PIL import Image
 
 
 @dataclass(frozen=True)
@@ -12,36 +11,38 @@ class CCColor:
     rgb: tuple[int, int, int]
 
 
-PALETTE: tuple[CCColor, ...] = (
-    CCColor("white", "0", (240, 240, 240)),
-    CCColor("orange", "1", (242, 178, 51)),
-    CCColor("magenta", "2", (229, 127, 216)),
-    CCColor("lightBlue", "3", (153, 178, 242)),
-    CCColor("yellow", "4", (222, 222, 108)),
-    CCColor("lime", "5", (127, 204, 25)),
-    CCColor("pink", "6", (242, 178, 204)),
-    CCColor("gray", "7", (76, 76, 76)),
-    CCColor("lightGray", "8", (153, 153, 153)),
-    CCColor("cyan", "9", (76, 153, 178)),
-    CCColor("purple", "a", (178, 102, 229)),
-    CCColor("blue", "b", (51, 102, 204)),
-    CCColor("brown", "c", (127, 102, 76)),
-    CCColor("green", "d", (87, 166, 78)),
-    CCColor("red", "e", (204, 76, 76)),
-    CCColor("black", "f", (17, 17, 17)),
+# Map-tuned palette. Order matches CC slots 0-15 (white=2^0, orange=2^1, ...).
+MAP_PALETTE: tuple[CCColor, ...] = (
+    CCColor("snow",      "0", (240, 240, 240)),
+    CCColor("sand",      "1", (232, 214, 158)),
+    CCColor("lava",      "2", (208,  80,  64)),
+    CCColor("shoal",     "3", (160, 208, 240)),
+    CCColor("plains",    "4", (156, 195,  74)),
+    CCColor("forest",    "5", ( 58, 110,  31)),
+    CCColor("pale",      "6", (207, 216, 156)),
+    CCColor("darkstone", "7", ( 58,  58,  58)),
+    CCColor("stone",     "8", (140, 140, 140)),
+    CCColor("ocean",     "9", ( 26,  76, 124)),
+    CCColor("flower",    "a", (200, 112, 160)),
+    CCColor("water",     "b", ( 64, 128, 192)),
+    CCColor("dirt",      "c", (140,  90,  45)),
+    CCColor("leaf",      "d", (101, 176,  64)),
+    CCColor("brick",     "e", (176,  80,  32)),
+    CCColor("void",      "f", ( 15,  15,  15)),
 )
 
 
-def nearest_code(rgb: tuple[int, int, int], palette: Iterable[CCColor] = PALETTE) -> str:
-    r, g, b = rgb
-    best_code = "f"
-    best_distance = float("inf")
+_PALETTE_IMAGE: Image.Image | None = None
 
-    for color in palette:
-        cr, cg, cb = color.rgb
-        distance = sqrt((r - cr) ** 2 + (g - cg) ** 2 + (b - cb) ** 2)
-        if distance < best_distance:
-            best_distance = distance
-            best_code = color.code
 
-    return best_code
+def palette_image() -> Image.Image:
+    global _PALETTE_IMAGE
+    if _PALETTE_IMAGE is None:
+        p = Image.new("P", (1, 1))
+        flat: list[int] = []
+        for c in MAP_PALETTE:
+            flat.extend(c.rgb)
+        flat.extend([0] * (768 - len(flat)))
+        p.putpalette(flat)
+        _PALETTE_IMAGE = p
+    return _PALETTE_IMAGE
