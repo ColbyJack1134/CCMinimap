@@ -8,30 +8,31 @@ local SIDECAR_INTERVAL = 2.5
 
 local SUB_W, SUB_H = 2, 3
 
--- 3-wide x 2-tall cell stencils (laid out row-major: (0,0),(1,0),(2,0),(0,1),(1,1),(2,1))
--- Bit positions per cell: 0=TL 1=TR 2=ML 3=MR 4=BL 5=BR
+-- 2-wide x 2-tall cell stencils (4x6 sub-pixels), ordered for compass heading
+-- 1=N (heading 0), 2=E (90), 3=S (180), 4=W (270)
 local TRIANGLE_STENCILS = {
-  { 0x00, 0x3F, 0x00, 0x0B, 0x3F, 0x07 }, -- 1 = S (yaw ~0)
-  { 0x3E, 0x34, 0x30, 0x2F, 0x07, 0x03 }, -- 2 = W (yaw ~90)
-  { 0x38, 0x3F, 0x34, 0x00, 0x3F, 0x00 }, -- 3 = N (yaw ~180)
-  { 0x30, 0x38, 0x3D, 0x03, 0x0B, 0x1F }, -- 4 = E (yaw ~270)
+  { 0x2E, 0x1D, 0x2A, 0x15 }, -- N up
+  { 0x30, 0x3D, 0x03, 0x1F }, -- E right
+  { 0x2A, 0x15, 0x0B, 0x07 }, -- S down
+  { 0x3E, 0x30, 0x2F, 0x03 }, -- W left
 }
 
 local SINGLE_CELL_TRIANGLES = {
-  [1] = 0x1C, -- S: ML+MR+BL
-  [2] = 0x2E, -- W: TR+ML+MR+BR (bit5 inversion)
-  [3] = 0x0E, -- N: TR+ML+MR
-  [4] = 0x1D, -- E: TL+ML+MR+BL
+  [1] = 0x0E, -- N
+  [2] = 0x1D, -- E
+  [3] = 0x1C, -- S
+  [4] = 0x2E, -- W (bit5 inversion)
 }
 
-local WAYPOINT_BITS = 0x0C -- ML+MR middle dash
+local WAYPOINT_BITS = 0x0C
+
+local NAV_TYPES   = { "navigation_table", "ship_navigation_table", "compass" }
+local NAV_METHODS = { "getRelativeAngle", "getYaw", "getRotationYaw", "getRotation" }
 
 local state = {
   bpp = 2,
   lod = 1,
-  lastX = nil, lastZ = nil,
-  movementHeading = 0,
-  shipYaw = 0,
+  shipHeading = 0,
   status = "starting",
   running = true,
   players = {},
@@ -40,7 +41,6 @@ local state = {
   lastFrame = nil,
   lastPos = nil,
 }
-
 local buttons = {}
 
 local function findMonitor()
@@ -72,11 +72,6 @@ local function urlencode(value)
   end)
 end
 
-local function atan2(y, x)
-  if math.atan2 then return math.atan2(y, x) end
-  return math.atan(y, x)
-end
-
 local function httpGetJson(url)
   local r, err = http.get(url, { ["accept"] = "application/json" })
   if not r then return nil, err end
@@ -85,16 +80,31 @@ local function httpGetJson(url)
   return textutils.unserializeJSON(body), nil
 end
 
+-- Find nav peripheral by type then by method scan; mirrors how peripheral.find("speaker") works.
 local function discoverNav()
   if NAV_PERIPHERAL then
     local p = peripheral.wrap(NAV_PERIPHERAL)
-    if p then return p, NAV_METHOD or "getYaw" end
+    if p then
+      local m = NAV_METHOD
+      if m and type(p[m]) == "function" then return p, m end
+      for _, mm in ipairs(NAV_METHODS) do
+        if type(p[mm]) == "function" then return p, mm end
+      end
+    end
+  end
+  for _, t in ipairs(NAV_TYPES) do
+    local p = peripheral.find(t)
+    if p then
+      for _, m in ipairs(NAV_METHODS) do
+        if type(p[m]) == "function" then return p, m end
+      end
+    end
   end
   for _, name in ipairs(peripheral.getNames()) do
     local p = peripheral.wrap(name)
     if p then
-      for _, method in ipairs({"getYaw", "getRotationYaw", "getRotation", "getDirection", "getOrientation"}) do
-        if type(p[method]) == "function" then return p, method end
+      for _, m in ipairs(NAV_METHODS) do
+        if type(p[m]) == "function" then return p, m end
       end
     end
   end
@@ -103,7 +113,7 @@ end
 
 local nav, navMethod = discoverNav()
 
-local function readShipYaw()
+local function readHeading()
   if not nav then return nil end
   local ok, result = pcall(nav[navMethod], nav)
   if not ok or result == nil then return nil end
@@ -159,12 +169,16 @@ local function worldToCell(wx, wz, cx, cz, mapH)
   return col, row
 end
 
-local function directionForYaw(yaw)
-  return math.floor((((yaw or 0) % 360) / 90) + 0.5) % 4 + 1
+-- Quantize a compass heading (0=N, 90=E, ...) to one of 4 stencils 1..4
+local function directionForHeading(h)
+  return math.floor((((h or 0) % 360) / 90) + 0.5) % 4 + 1
 end
 
--- OR a stencil into a single cell from the cached map and blit the result.
--- color is a CC palette hex char ('0'-'f') used for stencil-lit sub-pixels.
+-- Convert MC yaw (0=S) to compass heading (0=N)
+local function compassFromMcYaw(yaw)
+  return ((yaw or 0) + 180) % 360
+end
+
 local function overlayCell(col, row, stenBits, color, mapH)
   if col < 1 or col > width or row < 1 or row > mapH then return end
   if not state.lastFrame or not state.lastFrame.text or not state.lastFrame.text[row] then return end
@@ -188,16 +202,16 @@ local function overlayCell(col, row, stenBits, color, mapH)
   monitor.blit(string.char(new_pattern + 0x80), new_fg, new_bg)
 end
 
-local function overlaySelfTriangle(yaw, mapH)
-  local stencil = TRIANGLE_STENCILS[directionForYaw(yaw)]
+local function overlaySelfTriangle(heading, mapH)
+  local stencil = TRIANGLE_STENCILS[directionForHeading(heading)]
   if not stencil then return end
   local centerCol = math.floor(width / 2 + 0.5)
   local centerRow = math.floor(mapH / 2 + 0.5)
   local startCol = centerCol - 1
   local startRow = centerRow - 1
   for sr = 0, 1 do
-    for sc = 0, 2 do
-      overlayCell(startCol + sc, startRow + sr, stencil[sr * 3 + sc + 1], "0", mapH)
+    for sc = 0, 1 do
+      overlayCell(startCol + sc, startRow + sr, stencil[sr * 2 + sc + 1], "0", mapH)
     end
   end
 end
@@ -213,10 +227,9 @@ local function overlayOtherPlayers(cx, cz, mapH)
   for _, p in ipairs(state.players or {}) do
     if p.name ~= PLAYER_NAME and p.position then
       local col, row = worldToCell(p.position.x, p.position.z, cx, cz, mapH)
-      local stenBits = SINGLE_CELL_TRIANGLES[directionForYaw(p.rotation and p.rotation.yaw)]
-      if stenBits then
-        overlayCell(col, row, stenBits, colorForPlayer(p.uuid or p.name or "?"), mapH)
-      end
+      local heading = compassFromMcYaw(p.rotation and p.rotation.yaw)
+      local stenBits = SINGLE_CELL_TRIANGLES[directionForHeading(heading)]
+      overlayCell(col, row, stenBits, colorForPlayer(p.uuid or p.name or "?"), mapH)
     end
   end
 end
@@ -257,8 +270,9 @@ local function drawOsd(x, y, z)
   drawButton("zoom_in", 1, osdY, " + ")
   drawButton("zoom_out", 5, osdY, " - ")
   drawButton("lod", 9, osdY, "L" .. state.lod)
-  local coord = string.format("X%d Y%d Z%d H%03d B%s",
-    x, y or 0, z, math.floor((state.shipYaw or 0) % 360 + 0.5), tostring(state.bpp))
+  local headingStr = nav and tostring(math.floor((state.shipHeading or 0) + 0.5)) or "--"
+  local coord = string.format("X%d Z%d H%s B%s P%d",
+    x, z, headingStr, tostring(state.bpp), #(state.players or {}))
   local startCol = math.max(13, width - #coord + 1)
   drawText(startCol, osdY, coord:sub(1, width - startCol + 1), colors.white, colors.black)
 end
@@ -280,23 +294,13 @@ local function maybeFetchSidecar()
   if w then state.waypoints = w end
 end
 
-local function updateMovementHeading(x, z)
-  if state.lastX and state.lastZ then
-    local dx, dz = x - state.lastX, z - state.lastZ
-    if math.abs(dx) + math.abs(dz) > 0.15 then
-      state.movementHeading = (math.deg(atan2(-dx, dz)) + 360) % 360
-    end
-  end
-  state.lastX, state.lastZ = x, z
-end
-
 local function fullRedraw()
   if not state.lastFrame or not state.lastPos then return end
   local mapH = math.max(3, height - 1)
   drawCachedMap(mapH)
   overlayWaypoints(state.lastPos.x, state.lastPos.z, mapH)
   overlayOtherPlayers(state.lastPos.x, state.lastPos.z, mapH)
-  overlaySelfTriangle(state.shipYaw, mapH)
+  overlaySelfTriangle(state.shipHeading, mapH)
   drawOsd(math.floor(state.lastPos.x), math.floor(state.lastPos.y), math.floor(state.lastPos.z))
 end
 
@@ -305,7 +309,6 @@ local function mapLoop()
     maybeFetchSidecar()
     local x, y, z = gps.locate(0.5)
     if x then
-      updateMovementHeading(x, z)
       local data, err = httpGetJson(buildUrl(x, z))
       if data and data.text then
         state.status = "ok"
@@ -313,14 +316,11 @@ local function mapLoop()
         state.lastPos = { x = x, y = y or 0, z = z }
         fullRedraw()
       elseif data and data.error then
-        state.status = data.error
         drawError(data.error)
       else
-        state.status = "http failed"
         drawError(err or "http.get failed")
       end
     else
-      state.status = "no gps"
       drawError("No GPS lock")
     end
     sleep(FRAME_INTERVAL)
@@ -329,10 +329,11 @@ end
 
 local function fastLoop()
   while state.running do
-    state.shipYaw = readShipYaw() or state.movementHeading
+    local h = readHeading()
+    if h then state.shipHeading = h end
     if state.lastFrame and state.lastPos then
       local mapH = math.max(3, height - 1)
-      overlaySelfTriangle(state.shipYaw, mapH)
+      overlaySelfTriangle(state.shipHeading, mapH)
       drawOsd(math.floor(state.lastPos.x), math.floor(state.lastPos.y), math.floor(state.lastPos.z))
     end
     sleep(NAV_INTERVAL)
