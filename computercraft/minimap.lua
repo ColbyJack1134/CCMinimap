@@ -8,21 +8,17 @@ local SIDECAR_INTERVAL = 2.5
 
 local SUB_W, SUB_H = 2, 3
 
--- 2-wide x 2-tall cell stencils (4x6 sub-pixels), ordered for compass heading
+-- 3-wide x 2-tall cell stencils (6x6 sub-pixels), ordered for compass heading
 -- 1=N (heading 0), 2=E (90), 3=S (180), 4=W (270)
 local TRIANGLE_STENCILS = {
-  { 0x2E, 0x1D, 0x2A, 0x15 }, -- N up
-  { 0x30, 0x3D, 0x03, 0x1F }, -- E right
-  { 0x2A, 0x15, 0x0B, 0x07 }, -- S down
-  { 0x3E, 0x30, 0x2F, 0x03 }, -- W left
+  { 0x38, 0x3F, 0x34, 0x00, 0x3F, 0x00 }, -- N up
+  { 0x30, 0x38, 0x3D, 0x03, 0x0B, 0x1F }, -- E right
+  { 0x00, 0x3F, 0x00, 0x0B, 0x3F, 0x07 }, -- S down
+  { 0x3E, 0x34, 0x30, 0x2F, 0x07, 0x03 }, -- W left
 }
 
-local SINGLE_CELL_TRIANGLES = {
-  [1] = 0x0E, -- N
-  [2] = 0x1D, -- E
-  [3] = 0x1C, -- S
-  [4] = 0x2E, -- W (bit5 inversion)
-}
+-- 2-cell rounded blob for player markers; cells fully replaced with color+black.
+local PLAYER_MARKER = { 0x2E, 0x1D }
 
 local WAYPOINT_BITS = 0x0C
 
@@ -211,10 +207,21 @@ local function overlaySelfTriangle(heading, mapH)
   local startCol = centerCol - 1
   local startRow = centerRow - 1
   for sr = 0, 1 do
-    for sc = 0, 1 do
-      overlayCell(startCol + sc, startRow + sr, stencil[sr * 2 + sc + 1], "0", mapH)
+    for sc = 0, 2 do
+      overlayCell(startCol + sc, startRow + sr, stencil[sr * 3 + sc + 1], "0", mapH)
     end
   end
+end
+
+-- Fully replace a single cell with a teletext pattern using forced fg/bg (no terrain preservation).
+local function drawMarkerCell(col, row, pattern, fg, bg, mapH)
+  if col < 1 or col > width or row < 1 or row > mapH then return end
+  if bit32.band(pattern, 0x20) ~= 0 then
+    pattern = bit32.bxor(pattern, 0x3F)
+    fg, bg = bg, fg
+  end
+  monitor.setCursorPos(col, row)
+  monitor.blit(string.char(pattern + 0x80), fg, bg)
 end
 
 local PLAYER_HEX_SLOTS = { "0", "1", "2", "3", "4", "d" }
@@ -228,9 +235,9 @@ local function overlayOtherPlayers(cx, cz, mapH)
   for _, p in ipairs(state.players or {}) do
     if p.name ~= PLAYER_NAME and p.position then
       local col, row = worldToCell(p.position.x, p.position.z, cx, cz, mapH)
-      local heading = compassFromMcYaw(p.rotation and p.rotation.yaw)
-      local stenBits = SINGLE_CELL_TRIANGLES[directionForHeading(heading)]
-      overlayCell(col, row, stenBits, colorForPlayer(p.uuid or p.name or "?"), mapH)
+      local color = colorForPlayer(p.uuid or p.name or "?")
+      drawMarkerCell(col, row, PLAYER_MARKER[1], color, "f", mapH)
+      drawMarkerCell(col + 1, row, PLAYER_MARKER[2], color, "f", mapH)
     end
   end
 end
