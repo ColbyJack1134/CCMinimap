@@ -8,13 +8,14 @@ local SIDECAR_INTERVAL = 2.5
 
 local SUB_W, SUB_H = 2, 3
 
--- 3-wide x 2-tall cell stencils (6x6 sub-pixels), ordered for compass heading
+-- 4-wide x 3-tall cell stencils (8x9 sub-pixels), ordered for compass heading
 -- 1=N (heading 0), 2=E (90), 3=S (180), 4=W (270)
+-- Layout per stencil: row-major, cells (0,0) (1,0) (2,0) (3,0) (0,1) (1,1) ... (3,2)
 local TRIANGLE_STENCILS = {
-  { 0x38, 0x3F, 0x34, 0x00, 0x3F, 0x00 }, -- N up
-  { 0x30, 0x38, 0x3D, 0x03, 0x0B, 0x1F }, -- E right
-  { 0x00, 0x3F, 0x00, 0x0B, 0x3F, 0x07 }, -- S down
-  { 0x3E, 0x34, 0x30, 0x2F, 0x07, 0x03 }, -- W left
+  { 0x20, 0x3E, 0x3D, 0x10, 0x03, 0x2B, 0x17, 0x03, 0x00, 0x2A, 0x15, 0x00 }, -- N up
+  { 0x00, 0x00, 0x38, 0x3D, 0x3F, 0x3F, 0x3F, 0x3F, 0x00, 0x00, 0x0B, 0x1F }, -- E right
+  { 0x00, 0x2A, 0x15, 0x00, 0x30, 0x3A, 0x35, 0x30, 0x02, 0x2F, 0x1F, 0x01 }, -- S down
+  { 0x3E, 0x34, 0x00, 0x00, 0x3F, 0x3F, 0x3F, 0x3F, 0x2F, 0x07, 0x00, 0x00 }, -- W left
 }
 
 -- 2-cell rounded blob for player markers; cells fully replaced with color+black.
@@ -176,19 +177,27 @@ local function compassFromMcYaw(yaw)
   return ((yaw or 0) + 180) % 360
 end
 
-local function overlayCell(col, row, stenBits, color, mapH)
+local function overlayCell(col, row, stenBits, color, mapH, override)
   if col < 1 or col > width or row < 1 or row > mapH then return end
   if not state.lastFrame or not state.lastFrame.text or not state.lastFrame.text[row] then return end
   local packed = state.lastFrame.text[row]
-  if col > #packed then return end
+  local fg_row = state.lastFrame.fg[row]
+  local bg_row = state.lastFrame.bg[row]
+  if not fg_row or not bg_row or col > #packed or col > #fg_row or col > #bg_row then return end
   local cell_pattern = string.byte(packed, col) - 0x40
-  local cell_fg = state.lastFrame.fg[row]:sub(col, col)
-  local cell_bg = state.lastFrame.bg[row]:sub(col, col)
-  local new_pattern = bit32.bor(cell_pattern, stenBits)
-  local new_fg, new_bg
+  local cell_fg = fg_row:sub(col, col)
+  local cell_bg = bg_row:sub(col, col)
+  local new_pattern, new_fg, new_bg
   if stenBits == 0 then
-    new_fg, new_bg = cell_fg, cell_bg
+    -- nothing to draw here; re-blit original cell
+    new_pattern, new_fg, new_bg = cell_pattern, cell_fg, cell_bg
+  elseif override then
+    -- replace fg pattern with stencil; keep bg color so it blends with terrain
+    new_pattern = stenBits
+    new_fg, new_bg = color, cell_bg
   else
+    -- OR stencil into existing pattern; both terrain-fg and stencil pixels recolored
+    new_pattern = bit32.bor(cell_pattern, stenBits)
     new_fg, new_bg = color, cell_bg
   end
   if bit32.band(new_pattern, 0x20) ~= 0 then
@@ -204,11 +213,11 @@ local function overlaySelfTriangle(heading, mapH)
   if not stencil then return end
   local centerCol = math.floor(width / 2 + 0.5)
   local centerRow = math.floor(mapH / 2 + 0.5)
-  local startCol = centerCol - 1
+  local startCol = centerCol - 2
   local startRow = centerRow - 1
-  for sr = 0, 1 do
-    for sc = 0, 2 do
-      overlayCell(startCol + sc, startRow + sr, stencil[sr * 3 + sc + 1], "0", mapH)
+  for sr = 0, 2 do
+    for sc = 0, 3 do
+      overlayCell(startCol + sc, startRow + sr, stencil[sr * 4 + sc + 1], "0", mapH, true)
     end
   end
 end
@@ -255,7 +264,7 @@ local function overlayWaypoints(cx, cz, mapH)
   for _, wp in ipairs(state.waypoints or {}) do
     if wp.x and wp.z then
       local col, row = worldToCell(wp.x, wp.z, cx, cz, mapH)
-      overlayCell(col, row, WAYPOINT_BITS, paletteHexFor(wp.color), mapH)
+      overlayCell(col, row, WAYPOINT_BITS, paletteHexFor(wp.color), mapH, true)
     end
   end
 end
