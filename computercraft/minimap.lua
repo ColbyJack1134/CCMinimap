@@ -234,6 +234,14 @@ local function overlaySelfTriangle(heading, mapH)
     end
   end
 
+  -- Tip cell: where the very last sub-pixel sits, colored differently so
+  -- the head of the needle is distinguishable from the base.
+  local tipSxR = math.floor(centerSubX + dx * NEEDLE_LENGTH_SUB + 0.5)
+  local tipSyR = math.floor(centerSubY + dy * NEEDLE_LENGTH_SUB + 0.5)
+  local tipCol = math.floor(tipSxR / SUB_W) + 1
+  local tipRow = math.floor(tipSyR / SUB_H) + 1
+  local tipKey = tipCol * 1024 + tipRow
+
   -- Re-blit the area around the center: cells on the needle get the stencil
   -- bits, the rest restore from cache (overlayCell with stenBits=0 path).
   local startCol = centerCol - math.floor(NEEDLE_AREA_W / 2)
@@ -243,7 +251,8 @@ local function overlaySelfTriangle(heading, mapH)
       local col = startCol + c
       local row = startRow + r
       local key = col * 1024 + row
-      overlayCell(col, row, cells[key] or 0, "0", mapH, true)
+      local color = (key == tipKey) and "2" or "0"
+      overlayCell(col, row, cells[key] or 0, color, mapH, true)
     end
   end
 end
