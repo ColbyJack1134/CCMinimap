@@ -13,9 +13,24 @@ local SUB_W, SUB_H = 2, 3
 -- compass-heading direction. Length is in sub-pixels; area is the cell
 -- bounding box that gets re-blitted each tick (so old needle positions are
 -- restored from cache instead of leaving a trail).
-local NEEDLE_LENGTH_SUB = 5
-local NEEDLE_AREA_W = 7
-local NEEDLE_AREA_H = 5
+-- Load config (auto-created on first run with defaults).
+if not fs.exists(CONFIG_FILE) then
+  local f = fs.open(CONFIG_FILE, "w")
+  f.write('{ "headingOffset": 0, "needleLength": 5 }\n')
+  f.close()
+end
+local cfg = {}
+do
+  local f = fs.open(CONFIG_FILE, "r")
+  local raw = f and f.readAll() or ""
+  if f then f.close() end
+  local ok, parsed = pcall(textutils.unserialiseJSON, raw)
+  if ok and type(parsed) == "table" then cfg = parsed end
+end
+
+local NEEDLE_LENGTH_SUB = tonumber(cfg.needleLength) or 5
+local NEEDLE_AREA_W = 2 * math.ceil(NEEDLE_LENGTH_SUB / SUB_W) + 1
+local NEEDLE_AREA_H = 2 * math.ceil(NEEDLE_LENGTH_SUB / SUB_H) + 1
 
 -- 2-cell rounded blob for player markers; cells fully replaced with color+black.
 local PLAYER_MARKER = { 0x2E, 0x1D }
@@ -24,23 +39,8 @@ local WAYPOINT_BITS = 0x0C
 
 local NAV_TYPES   = { "navigation_table", "ship_navigation_table", "compass" }
 local NAV_METHODS = { "getRelativeAngle", "getYaw", "getRotationYaw", "getRotation" }
--- Degrees added to the raw nav reading. Stored in minimap.cfg so it
--- survives reinstalls. Edit the file directly: edit minimap.cfg
-local HEADING_OFFSET_DEG = 0
-if not fs.exists(CONFIG_FILE) then
-  local f = fs.open(CONFIG_FILE, "w")
-  f.write('{ "headingOffset": 0 }\n')
-  f.close()
-end
-do
-  local f = fs.open(CONFIG_FILE, "r")
-  local raw = f and f.readAll() or ""
-  if f then f.close() end
-  local ok, cfg = pcall(textutils.unserialiseJSON, raw)
-  if ok and type(cfg) == "table" and type(cfg.headingOffset) == "number" then
-    HEADING_OFFSET_DEG = cfg.headingOffset
-  end
-end
+-- Edit minimap.cfg to tune (headingOffset, needleLength).
+local HEADING_OFFSET_DEG = tonumber(cfg.headingOffset) or 0
 
 local state = {
   bpp = 2,
