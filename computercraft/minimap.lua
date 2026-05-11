@@ -440,9 +440,11 @@ end
 -- panel background and a colored fill that grows from the bottom up to the
 -- current altitude. Top of the fill is the indicator.
 local TAPE_WIDTH = 3
-local TAPE_BG = "8"   -- stone (dark gray panel)
-local TAPE_FILL = "9" -- ocean (blue fill)
-local TAPE_TIP = "2"  -- lava (red top edge)
+local TAPE_PAD_RIGHT = 1   -- empty cells between tape and right screen edge
+local TAPE_PAD_VERT  = 1   -- empty rows above and below the tape
+local TAPE_BG   = "f"      -- void (near black, contrasts with ocean)
+local TAPE_FILL = "e"      -- brick (orange-red fill)
+local TAPE_TIP  = "0"      -- snow (white top edge)
 
 local function overlayAltitudeTape(mapH)
   for key in pairs(state.lastTapeCells) do
@@ -452,14 +454,19 @@ local function overlayAltitudeTape(mapH)
   end
   state.lastTapeCells = {}
   if not SHOW_ALT_TAPE or not state.altitude then return end
+  local topRow = 1 + TAPE_PAD_VERT
+  local botRow = mapH - TAPE_PAD_VERT
+  if botRow < topRow then return end
+  local height_rows = botRow - topRow + 1
   local cols = {}
-  for i = 1, TAPE_WIDTH do cols[i] = width - TAPE_WIDTH + i end
+  for i = 1, TAPE_WIDTH do cols[i] = width - TAPE_PAD_RIGHT - TAPE_WIDTH + i end
   local altRatio = math.max(0, math.min(1, state.altitude / MAX_ALT))
-  local maxSubY = mapH * SUB_H - 1
+  local maxSubY = height_rows * SUB_H - 1
   local altSubY = math.floor((1 - altRatio) * maxSubY + 0.5)
-  for r = 1, mapH do
+  for r = topRow, botRow do
+    local relRow = r - topRow
+    local rowTopSubY = relRow * SUB_H
     local pattern = 0
-    local rowTopSubY = (r - 1) * SUB_H
     for sy = 0, SUB_H - 1 do
       local globalY = rowTopSubY + sy
       if globalY >= altSubY then
@@ -468,13 +475,9 @@ local function overlayAltitudeTape(mapH)
         end
       end
     end
-    -- Highlight the indicator row (single sub-pixel row at the top of the fill).
     local indSy = altSubY - rowTopSubY
     local fg = TAPE_FILL
-    if indSy >= 0 and indSy < SUB_H then
-      -- top row of fill is in this cell; recolor the cell's fg to the tip color.
-      fg = TAPE_TIP
-    end
+    if indSy >= 0 and indSy < SUB_H then fg = TAPE_TIP end
     for _, c in ipairs(cols) do
       monitor.setCursorPos(c, r)
       local emit = pattern
@@ -493,10 +496,12 @@ end
 -- a dark panel background, white scale tick marks, and a red needle. Needle
 -- sweeps left at -max, up at 0, right at +max -- supports negative speed.
 local DIAL_W = 7
-local DIAL_H = 4
-local DIAL_BG = "8"     -- panel
-local DIAL_TICK = "0"   -- white scale marks
-local DIAL_NEEDLE = "2" -- red needle
+local DIAL_H = 3
+local DIAL_PAD_LEFT = 1   -- cells of map between dial and left edge
+local DIAL_PAD_BOT  = 1   -- cells of map between dial and OSD
+local DIAL_BG = "f"       -- void (contrasts with ocean)
+local DIAL_TICK = "0"     -- white scale marks
+local DIAL_NEEDLE = "2"   -- red needle
 
 local function overlaySpeedDial(mapH)
   for key in pairs(state.lastDialCells) do
@@ -507,8 +512,8 @@ local function overlaySpeedDial(mapH)
   state.lastDialCells = {}
   if not SHOW_SPEED_DIAL or not state.velocity then return end
 
-  local startCol = 1
-  local startRow = math.max(1, mapH - DIAL_H + 1)
+  local startCol = 1 + DIAL_PAD_LEFT
+  local startRow = math.max(1, mapH - DIAL_PAD_BOT - DIAL_H + 1)
   local centerCol = startCol + math.floor(DIAL_W / 2)
   local centerRow = startRow + DIAL_H - 1
   -- Needle origin at bottom-center sub-pixel.
