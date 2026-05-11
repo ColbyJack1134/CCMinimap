@@ -23,7 +23,8 @@ if not fs.exists(CONFIG_FILE) then
   "showAltitudeTape": true,
   "showSpeedDial": true,
   "maxAltitude": 320,
-  "maxSpeed": 5
+  "maxSpeed": 5,
+  "velocityFlipped": true
 }
 ]])
   f.close()
@@ -58,6 +59,7 @@ local SHOW_ALT_TAPE   = (cfg.showAltitudeTape ~= false)
 local SHOW_SPEED_DIAL = (cfg.showSpeedDial ~= false)
 local MAX_ALT   = tonumber(cfg.maxAltitude) or 320
 local MAX_SPEED = tonumber(cfg.maxSpeed) or 5
+local VELOCITY_FLIPPED = (cfg.velocityFlipped ~= false)
 local NEEDLE_AREA_W = 2 * math.ceil(NEEDLE_LENGTH_SUB / SUB_W) + 1
 local NEEDLE_AREA_H = 2 * math.ceil(NEEDLE_LENGTH_SUB / SUB_H) + 1
 
@@ -428,12 +430,20 @@ end
 local function readVelocity()
   if not velSensor then return nil end
   local ok, v = pcall(velSensor.getVelocity)
-  if ok and type(v) == "number" then return v end
+  if ok and type(v) == "number" then
+    if VELOCITY_FLIPPED then v = -v end
+    return v
+  end
 end
 
--- Altitude tape on the rightmost column. Only cells with a tick or the
--- current-altitude indicator get painted; the rest stay terrain (so the tape
--- doesn't black out the right edge of the map).
+-- Altitude tape on the right edge. Wide thermometer-style bar with a dark
+-- panel background and a colored fill that grows from the bottom up to the
+-- current altitude. Top of the fill is the indicator.
+local TAPE_WIDTH = 3
+local TAPE_BG = "8"   -- stone (dark gray panel)
+local TAPE_FILL = "9" -- ocean (blue fill)
+local TAPE_TIP = "2"  -- lava (red top edge)
+
 local function overlayAltitudeTape(mapH)
   for key in pairs(state.lastTapeCells) do
     local c = math.floor(key / 1024)
@@ -442,34 +452,54 @@ local function overlayAltitudeTape(mapH)
   end
   state.lastTapeCells = {}
   if not SHOW_ALT_TAPE or not state.altitude then return end
-  local col = width
+  local cols = {}
+  for i = 1, TAPE_WIDTH do cols[i] = width - TAPE_WIDTH + i end
   local altRatio = math.max(0, math.min(1, state.altitude / MAX_ALT))
-  local cells = {}
-  local function setSub(p, color, prio)
-    if p < 0 or p >= mapH * SUB_H then return end
-    local row = math.floor(p / SUB_H) + 1
-    local sy = p - (row - 1) * SUB_H
-    cells[row] = cells[row] or { pattern = 0, color = color, prio = prio }
-    cells[row].pattern = bit32.bor(cells[row].pattern,
-      bit32.lshift(1, sy * SUB_W), bit32.lshift(1, sy * SUB_W + 1))
-    if prio > cells[row].prio then
-      cells[row].color = color; cells[row].prio = prio
+  local maxSubY = mapH * SUB_H - 1
+  local altSubY = math.floor((1 - altRatio) * maxSubY + 0.5)
+  for r = 1, mapH do
+    local pattern = 0
+    local rowTopSubY = (r - 1) * SUB_H
+    for sy = 0, SUB_H - 1 do
+      local globalY = rowTopSubY + sy
+      if globalY >= altSubY then
+        for sx = 0, SUB_W - 1 do
+          pattern = bit32.bor(pattern, bit32.lshift(1, sy * SUB_W + sx))
+        end
+      end
     end
-  end
-  for tick = 1, 3 do
-    setSub(math.floor(tick / 4 * (mapH * SUB_H - 1) + 0.5), "8", 1)
-  end
-  local indP = math.floor((1 - altRatio) * (mapH * SUB_H - 1) + 0.5)
-  for d = -1, 1 do setSub(indP + d, "1", 2) end
-  for row, c in pairs(cells) do
-    overlayCell(col, row, c.pattern, c.color, mapH, true)
-    state.lastTapeCells[col * 1024 + row] = true
+    -- Highlight the indicator row (single sub-pixel row at the top of the fill).
+    local indSy = altSubY - rowTopSubY
+    local fg = TAPE_FILL
+    if indSy >= 0 and indSy < SUB_H then
+      -- top row of fill is in this cell; recolor the cell's fg to the tip color.
+      fg = TAPE_TIP
+    end
+    for _, c in ipairs(cols) do
+      monitor.setCursorPos(c, r)
+      local emit = pattern
+      local f, b = fg, TAPE_BG
+      if bit32.band(emit, 0x20) ~= 0 then
+        emit = bit32.bxor(emit, 0x3F)
+        f, b = b, f
+      end
+      monitor.blit(string.char(emit + 0x80), f, b)
+      state.lastTapeCells[c * 1024 + r] = true
+    end
   end
 end
 
--- Speedometer needle in a 3x3 cell area at top-right (just left of the tape).
--- Sweep: 0 speed = needle points left, max = points right, mid = up.
--- Only cells the needle passes through get painted.
+end
+
+-- Big speedometer in the bottom-left of the map area. Half-circle dial with
+-- a dark panel background, white scale tick marks, and a red needle. Needle
+-- sweeps left at -max, up at 0, right at +max -- supports negative speed.
+local DIAL_W = 7
+local DIAL_H = 4
+local DIAL_BG = "8"     -- panel
+local DIAL_TICK = "0"   -- white scale marks
+local DIAL_NEEDLE = "2" -- red needle
+
 local function overlaySpeedDial(mapH)
   for key in pairs(state.lastDialCells) do
     local c = math.floor(key / 1024)
@@ -478,35 +508,75 @@ local function overlaySpeedDial(mapH)
   end
   state.lastDialCells = {}
   if not SHOW_SPEED_DIAL or not state.velocity then return end
-  local centerCol = width - 2
-  local centerRow = 3
-  local lengthSub = 3
-  local ratio = math.max(0, math.min(1, state.velocity / MAX_SPEED))
-  local rad = math.rad((ratio - 0.5) * 180)
-  local dx = math.sin(rad); local dy = -math.cos(rad)
+
+  local startCol = 1
+  local startRow = math.max(1, mapH - DIAL_H + 1)
+  local centerCol = startCol + math.floor(DIAL_W / 2)
+  local centerRow = startRow + DIAL_H - 1
+  -- Needle origin at bottom-center sub-pixel.
   local centerSubX = (centerCol - 1) * SUB_W + (SUB_W - 1) / 2
-  local centerSubY = (centerRow - 1) * SUB_H + (SUB_H - 1) / 2
-  local cells = {}
-  local steps = lengthSub * 5
-  for i = 0, steps do
-    local t = i / steps
-    local sxR = math.floor(centerSubX + dx * lengthSub * t + 0.5)
-    local syR = math.floor(centerSubY + dy * lengthSub * t + 0.5)
+  local centerSubY = (centerRow - 1) * SUB_H + SUB_H - 1
+  local radius = math.min(DIAL_W * SUB_W, DIAL_H * SUB_H * 2) / 2 - 1
+
+  local needleCells = {}
+  local tickCells = {}
+
+  local function lightSub(map, sxR, syR)
     local col = math.floor(sxR / SUB_W) + 1
     local row = math.floor(syR / SUB_H) + 1
     local sx = sxR - (col - 1) * SUB_W
     local sy = syR - (row - 1) * SUB_H
-    if sx >= 0 and sx < SUB_W and sy >= 0 and sy < SUB_H then
-      local key = col * 1024 + row
-      cells[key] = bit32.bor(cells[key] or 0, bit32.lshift(1, sy * SUB_W + sx))
-    end
+    if col < startCol or col > startCol + DIAL_W - 1 then return end
+    if row < startRow or row > startRow + DIAL_H - 1 then return end
+    if sx < 0 or sx >= SUB_W or sy < 0 or sy >= SUB_H then return end
+    local key = col * 1024 + row
+    map[key] = bit32.bor(map[key] or 0, bit32.lshift(1, sy * SUB_W + sx))
   end
-  for key, bits in pairs(cells) do
-    local col = math.floor(key / 1024)
-    local row = key - col * 1024
-    if col >= 1 and col <= width and row >= 1 and row <= mapH then
-      overlayCell(col, row, bits, "1", mapH, true)
-      state.lastDialCells[key] = true
+
+  -- Tick marks: 5 marks across the half-circle (-90, -45, 0, +45, +90 degrees).
+  for _, deg in ipairs({-90, -45, 0, 45, 90}) do
+    local rad = math.rad(deg)
+    local sxR = math.floor(centerSubX + math.sin(rad) * radius + 0.5)
+    local syR = math.floor(centerSubY - math.cos(rad) * radius + 0.5)
+    lightSub(tickCells, sxR, syR)
+  end
+
+  -- Needle: walk from center to length=radius-1 at angle = ratio*90.
+  local ratio = math.max(-1, math.min(1, state.velocity / MAX_SPEED))
+  local angleDeg = ratio * 90
+  local rad = math.rad(angleDeg)
+  local dx = math.sin(rad)
+  local dy = -math.cos(rad)
+  local needleLen = radius - 1
+  local steps = math.floor(needleLen * 5)
+  for i = 0, steps do
+    local t = i / steps
+    local sxR = math.floor(centerSubX + dx * needleLen * t + 0.5)
+    local syR = math.floor(centerSubY + dy * needleLen * t + 0.5)
+    lightSub(needleCells, sxR, syR)
+  end
+
+  -- Render every cell in the dial area: panel bg + needle/tick if present.
+  for r = startRow, startRow + DIAL_H - 1 do
+    for c = startCol, startCol + DIAL_W - 1 do
+      if r >= 1 and r <= mapH and c >= 1 and c <= width then
+        local key = c * 1024 + r
+        local pattern = needleCells[key] or 0
+        local fg = DIAL_NEEDLE
+        if pattern == 0 and tickCells[key] then
+          pattern = tickCells[key]
+          fg = DIAL_TICK
+        end
+        monitor.setCursorPos(c, r)
+        local emit = pattern
+        local f, b = fg, DIAL_BG
+        if bit32.band(emit, 0x20) ~= 0 then
+          emit = bit32.bxor(emit, 0x3F)
+          f, b = b, f
+        end
+        monitor.blit(string.char(emit + 0x80), f, b)
+        state.lastDialCells[key] = true
+      end
     end
   end
 end
