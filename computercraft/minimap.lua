@@ -35,7 +35,8 @@ local NEEDLE_AREA_H = 2 * math.ceil(NEEDLE_LENGTH_SUB / SUB_H) + 1
 -- 2-cell rounded blob for player markers; cells fully replaced with color+black.
 local PLAYER_MARKER = { 0x2E, 0x1D }
 
-local WAYPOINT_BITS = 0x0C
+-- Hollow circle, 2 cells wide -- same footprint as PLAYER_MARKER but outlined.
+local WAYPOINT_MARKER = { 0x26, 0x19 }
 
 local NAV_TYPES   = { "navigation_table", "ship_navigation_table", "compass" }
 local NAV_METHODS = { "getRelativeAngle", "getYaw", "getRotationYaw", "getRotation" }
@@ -327,7 +328,9 @@ local function overlayWaypoints(cx, cz, mapH)
   for _, wp in ipairs(state.waypoints or {}) do
     if wp.x and wp.z then
       local col, row = worldToCell(wp.x, wp.z, cx, cz, mapH)
-      overlayCell(col, row, WAYPOINT_BITS, paletteHexFor(wp.color), mapH, true)
+      local color = paletteHexFor(wp.color)
+      drawMarkerCell(col, row, WAYPOINT_MARKER[1], color, "f", mapH)
+      drawMarkerCell(col + 1, row, WAYPOINT_MARKER[2], color, "f", mapH)
     end
   end
 end
