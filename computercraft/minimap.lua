@@ -383,8 +383,8 @@ local function overlayDotTrail(cx, cz, mapH)
   end
 end
 
--- Records intended redstone state per channel. TODO: when integrators are
--- installed, also call peripheral.call("redstoneIntegrator_X", "setOutput",
+-- Records intended redstone state per channel. TODO: when redstone relays
+-- are installed, also call peripheral.call("redstone_relay_X", "setOutput",
 -- side, on) here. Channels: "forward", "left", "right", "back".
 local function setControl(name, on)
   state.controls[name] = on and true or false
