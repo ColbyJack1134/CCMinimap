@@ -24,7 +24,7 @@ local WAYPOINT_BITS = 0x0C
 local NAV_TYPES   = { "navigation_table", "ship_navigation_table", "compass" }
 local NAV_METHODS = { "getRelativeAngle", "getYaw", "getRotationYaw", "getRotation" }
 -- Degrees added to the raw nav reading. Tune if the needle points the wrong way.
-local HEADING_OFFSET_DEG = 90
+local HEADING_OFFSET_DEG = 0
 
 local state = {
   bpp = 2,
@@ -115,12 +115,19 @@ local function readHeading()
   if not nav then return nil end
   local ok, result = pcall(nav[navMethod], nav)
   if not ok or result == nil then return nil end
-  local h
-  if type(result) == "number" then h = result
-  elseif type(result) == "table" then h = result.yaw or result.heading or result[1]
+  local rel
+  if type(result) == "number" then rel = result
+  elseif type(result) == "table" then rel = result.yaw or result.heading or result[1]
   end
-  if not h then return nil end
-  return (h + HEADING_OFFSET_DEG) % 360
+  if not rel then return nil end
+  -- Compass needle points at spawn (0, 0, 0). The peripheral returns its angle
+  -- relative to ship-forward (CW degrees). Ship heading = world bearing to
+  -- spawn minus that relative angle. Atan2 args use MC convention (X=east,
+  -- Z=south, heading 0 = -Z = north, CW positive).
+  if not state.lastPos then return nil end
+  local sx, sz = state.lastPos.x, state.lastPos.z
+  local bearingToSpawn = math.deg(math.atan2(-sx, sz))
+  return (bearingToSpawn - rel + HEADING_OFFSET_DEG) % 360
 end
 
 local function applyPalette(palette)
