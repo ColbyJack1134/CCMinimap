@@ -489,8 +489,6 @@ local function overlayAltitudeTape(mapH)
   end
 end
 
-end
-
 -- Big speedometer in the bottom-left of the map area. Half-circle dial with
 -- a dark panel background, white scale tick marks, and a red needle. Needle
 -- sweeps left at -max, up at 0, right at +max -- supports negative speed.
