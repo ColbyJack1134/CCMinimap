@@ -38,6 +38,12 @@ local PLAYER_MARKER = { 0x2E, 0x1D }
 -- Hollow circle, 2 cells wide -- same footprint as PLAYER_MARKER but outlined.
 local WAYPOINT_MARKER = { 0x26, 0x19 }
 
+-- Autopilot tunables.
+local ARRIVAL_RADIUS = 15      -- blocks; stop when within this of target
+local TURN_THRESHOLD = 20      -- degrees; |err| above this = pure turn, no forward
+local FINE_THRESHOLD = 5       -- degrees; |err| above this = forward + correction
+local TRAIL_STEP = 2           -- plot a trail dot every N cells from ship to target
+
 local NAV_TYPES   = { "navigation_table", "ship_navigation_table", "compass" }
 local NAV_METHODS = { "getRelativeAngle", "getYaw", "getRotationYaw", "getRotation" }
 -- Edit minimap.cfg to tune (headingOffset, needleLength).
@@ -47,6 +53,11 @@ local state = {
   bpp = 2,
   lod = 1,
   shipHeading = 0,
+  target = nil,         -- { kind, name, x, z, color } - selected destination
+  engaged = false,      -- autopilot driving controls?
+  autoStatus = "",      -- short status string for the auto bar
+  controls = {},        -- intended redstone state per channel; pending hardware
+  targetCells = {},     -- list of clickable target hitboxes built each frame
   status = "starting",
   running = true,
   players = {},
@@ -304,13 +315,24 @@ local function colorForPlayer(key)
   return PLAYER_HEX_SLOTS[(sum % #PLAYER_HEX_SLOTS) + 1]
 end
 
+local function isSelected(kind, name)
+  return state.target and state.target.kind == kind and state.target.name == name
+end
+
 local function overlayOtherPlayers(cx, cz, mapH)
   for _, p in ipairs(state.players or {}) do
     if p.name ~= PLAYER_NAME and p.position then
       local col, row = worldToCell(p.position.x, p.position.z, cx, cz, mapH)
       local color = colorForPlayer(p.uuid or p.name or "?")
-      drawMarkerCell(col, row, PLAYER_MARKER[1], color, "f", mapH)
-      drawMarkerCell(col + 1, row, PLAYER_MARKER[2], color, "f", mapH)
+      local fg, bg = color, "f"
+      if isSelected("player", p.name) then fg, bg = "f", color end
+      drawMarkerCell(col, row, PLAYER_MARKER[1], fg, bg, mapH)
+      drawMarkerCell(col + 1, row, PLAYER_MARKER[2], fg, bg, mapH)
+      table.insert(state.targetCells, {
+        col1 = col, col2 = col + 1, row = row,
+        kind = "player", name = p.name,
+        x = p.position.x, z = p.position.z, color = color,
+      })
     end
   end
 end
@@ -329,9 +351,72 @@ local function overlayWaypoints(cx, cz, mapH)
     if wp.x and wp.z then
       local col, row = worldToCell(wp.x, wp.z, cx, cz, mapH)
       local color = paletteHexFor(wp.color)
-      drawMarkerCell(col, row, WAYPOINT_MARKER[1], color, "f", mapH)
-      drawMarkerCell(col + 1, row, WAYPOINT_MARKER[2], color, "f", mapH)
+      local fg, bg = color, "f"
+      if isSelected("waypoint", wp.name) then fg, bg = "f", color end
+      drawMarkerCell(col, row, WAYPOINT_MARKER[1], fg, bg, mapH)
+      drawMarkerCell(col + 1, row, WAYPOINT_MARKER[2], fg, bg, mapH)
+      table.insert(state.targetCells, {
+        col1 = col, col2 = col + 1, row = row,
+        kind = "waypoint", name = wp.name,
+        x = wp.x, z = wp.z, color = color,
+      })
     end
+  end
+end
+
+local function overlayDotTrail(cx, cz, mapH)
+  if not state.target then return end
+  local tcol, trow = worldToCell(state.target.x, state.target.z, cx, cz, mapH)
+  local centerCol = math.floor(width / 2 + 0.5)
+  local centerRow = math.floor(mapH / 2 + 0.5)
+  local dxC = tcol - centerCol
+  local dyC = trow - centerRow
+  local steps = math.max(math.abs(dxC), math.abs(dyC))
+  if steps < 2 then return end
+  for i = TRAIL_STEP, steps - 1, TRAIL_STEP do
+    local t = i / steps
+    local c = math.floor(centerCol + dxC * t + 0.5)
+    local r = math.floor(centerRow + dyC * t + 0.5)
+    if c >= 1 and c <= width and r >= 1 and r <= mapH then
+      overlayCell(c, r, 0x0C, state.target.color, mapH, true)
+    end
+  end
+end
+
+-- Records intended redstone state per channel. TODO: when integrators are
+-- installed, also call peripheral.call("redstoneIntegrator_X", "setOutput",
+-- side, on) here. Channels: "forward", "left", "right", "back".
+local function setControl(name, on)
+  state.controls[name] = on and true or false
+end
+
+local function autopilotTick()
+  if not state.engaged or not state.target or not state.lastPos then
+    setControl("forward", false); setControl("left", false); setControl("right", false)
+    return
+  end
+  local dx = (state.target.x or 0) - state.lastPos.x
+  local dz = (state.target.z or 0) - state.lastPos.z
+  local range = math.sqrt(dx * dx + dz * dz)
+  if range < ARRIVAL_RADIUS then
+    setControl("forward", false); setControl("left", false); setControl("right", false)
+    state.engaged = false
+    state.autoStatus = "ARRIVED"
+    return
+  end
+  local desired = math.deg(math.atan2(dx, -dz)) % 360
+  local err = ((desired - (state.shipHeading or 0)) + 540) % 360 - 180
+  if math.abs(err) > TURN_THRESHOLD then
+    setControl("forward", false)
+    setControl("left", err < 0); setControl("right", err > 0)
+    state.autoStatus = (err < 0 and "TURN L" or "TURN R") .. string.format(" %dm", math.floor(range))
+  elseif math.abs(err) > FINE_THRESHOLD then
+    setControl("forward", true)
+    setControl("left", err < 0); setControl("right", err > 0)
+    state.autoStatus = string.format("FWD %s %dm", err < 0 and "L" or "R", math.floor(range))
+  else
+    setControl("forward", true); setControl("left", false); setControl("right", false)
+    state.autoStatus = string.format("FWD %dm", math.floor(range))
   end
 end
 
@@ -345,6 +430,22 @@ end
 local function drawButton(id, x, y, label)
   buttons[id] = { x1 = x, y1 = y, x2 = x + #label - 1, y2 = y }
   drawText(x, y, label, colors.black, colors.lightGray)
+end
+
+local function drawAutoBar()
+  if state.lastError then return end
+  if not state.target then return end
+  monitor.setCursorPos(1, 1)
+  monitor.setBackgroundColor(colors.black)
+  monitor.clearLine()
+  local label = state.engaged and " STOP " or " AUTO "
+  drawButton("auto", 1, 1, label)
+  drawButton("clear_target", 8, 1, " X ")
+  local dx = (state.target.x or 0) - (state.lastPos and state.lastPos.x or 0)
+  local dz = (state.target.z or 0) - (state.lastPos and state.lastPos.z or 0)
+  local range = math.floor(math.sqrt(dx * dx + dz * dz))
+  local txt = string.format("%s %dm %s", state.target.name or "?", range, state.autoStatus or "")
+  if 12 < width then drawText(12, 1, txt:sub(1, width - 11), colors.white, colors.black) end
 end
 
 local function drawOsd(x, y, z)
@@ -393,12 +494,24 @@ end
 
 local function fullRedraw()
   if not state.lastFrame or not state.lastPos then return end
+  if state.target and state.target.kind == "player" then
+    for _, pp in ipairs(state.players or {}) do
+      if pp.name == state.target.name and pp.position then
+        state.target.x = pp.position.x
+        state.target.z = pp.position.z
+        break
+      end
+    end
+  end
   local mapH = math.max(3, height - 1)
+  state.targetCells = {}
   drawCachedMap(mapH)
+  overlayDotTrail(state.lastPos.x, state.lastPos.z, mapH)
   overlayWaypoints(state.lastPos.x, state.lastPos.z, mapH)
   overlayOtherPlayers(state.lastPos.x, state.lastPos.z, mapH)
   overlaySelfTriangle(state.shipHeading, mapH)
   drawOsd(math.floor(state.lastPos.x), math.floor(state.lastPos.y), math.floor(state.lastPos.z))
+  drawAutoBar()
 end
 
 local function mapTick()
@@ -432,10 +545,12 @@ end
 local function fastTick()
   local h = readHeading()
   if h then state.shipHeading = h end
+  autopilotTick()
   if state.lastFrame and state.lastPos then
     local mapH = math.max(3, height - 1)
     overlaySelfTriangle(state.shipHeading, mapH)
     drawOsd(math.floor(state.lastPos.x), math.floor(state.lastPos.y), math.floor(state.lastPos.z))
+    drawAutoBar()
   end
 end
 
@@ -448,8 +563,10 @@ local function fastLoop()
 end
 
 local function handleTouch(_, side, x, y)
+  local hit = false
   for id, btn in pairs(buttons) do
     if x >= btn.x1 and x <= btn.x2 and y >= btn.y1 and y <= btn.y2 then
+      hit = true
       if id == "zoom_in" then
         state.bpp = clamp(state.bpp / 2, 0.25, 128)
         state.lod = pickLod(state.bpp)
@@ -459,7 +576,22 @@ local function handleTouch(_, side, x, y)
       elseif id == "lod" then
         state.lod = state.lod + 1
         if state.lod > 3 then state.lod = 1 end
+      elseif id == "auto" then
+        if state.target then state.engaged = not state.engaged end
+      elseif id == "clear_target" then
+        state.target = nil
+        state.engaged = false
+        state.autoStatus = ""
       end
+    end
+  end
+  if hit then return end
+  for _, t in ipairs(state.targetCells or {}) do
+    if y == t.row and x >= t.col1 and x <= t.col2 then
+      state.target = { kind = t.kind, name = t.name, x = t.x, z = t.z, color = t.color }
+      state.engaged = false
+      state.autoStatus = ""
+      return
     end
   end
 end
