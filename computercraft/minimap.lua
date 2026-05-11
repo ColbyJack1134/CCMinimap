@@ -19,7 +19,7 @@ if not fs.exists(CONFIG_FILE) then
   f.write([[{
   "headingOffset": 0,
   "needleLength": 5,
-  "controlSides": { "forward": "south", "back": "top", "left": "left", "right": "right" }
+  "controlSides": { "forward": "back", "back": "top", "left": "left", "right": "right" }
 }
 ]])
   f.close()
@@ -41,7 +41,7 @@ local function cfgSide(name, default)
   return default
 end
 local CONTROL_SIDES = {
-  forward = cfgSide("forward", "south"),
+  forward = cfgSide("forward", "back"),
   back    = cfgSide("back",    "top"),
   left    = cfgSide("left",    "left"),
   right   = cfgSide("right",   "right"),
