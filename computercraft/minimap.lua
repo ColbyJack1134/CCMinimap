@@ -16,7 +16,12 @@ local SUB_W, SUB_H = 2, 3
 -- Load config (auto-created on first run with defaults).
 if not fs.exists(CONFIG_FILE) then
   local f = fs.open(CONFIG_FILE, "w")
-  f.write('{ "headingOffset": 0, "needleLength": 5 }\n')
+  f.write([[{
+  "headingOffset": 0,
+  "needleLength": 5,
+  "controlSides": { "forward": "south", "back": "top", "left": "left", "right": "right" }
+}
+]])
   f.close()
 end
 local cfg = {}
@@ -29,6 +34,19 @@ do
 end
 
 local NEEDLE_LENGTH_SUB = tonumber(cfg.needleLength) or 5
+
+local function cfgSide(name, default)
+  local cs = cfg.controlSides
+  if type(cs) == "table" and type(cs[name]) == "string" then return cs[name] end
+  return default
+end
+local CONTROL_SIDES = {
+  forward = cfgSide("forward", "south"),
+  back    = cfgSide("back",    "top"),
+  left    = cfgSide("left",    "left"),
+  right   = cfgSide("right",   "right"),
+}
+local relay = peripheral.find("redstone_relay")
 local NEEDLE_AREA_W = 2 * math.ceil(NEEDLE_LENGTH_SUB / SUB_W) + 1
 local NEEDLE_AREA_H = 2 * math.ceil(NEEDLE_LENGTH_SUB / SUB_H) + 1
 
@@ -383,11 +401,14 @@ local function overlayDotTrail(cx, cz, mapH)
   end
 end
 
--- Records intended redstone state per channel. TODO: when redstone relays
--- are installed, also call peripheral.call("redstone_relay_X", "setOutput",
--- side, on) here. Channels: "forward", "left", "right", "back".
+-- Channels: "forward", "left", "right", "back". Side mapping comes from
+-- minimap.cfg controlSides. If no relay is attached, we still record the
+-- intended state for the auto bar to display.
 local function setControl(name, on)
-  state.controls[name] = on and true or false
+  on = on and true or false
+  state.controls[name] = on
+  local side = CONTROL_SIDES[name]
+  if relay and side then pcall(relay.setOutput, side, on) end
 end
 
 local function autopilotTick()
