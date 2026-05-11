@@ -1,16 +1,4 @@
-local args = {...}
 local CONFIG_FILE = "minimap.cfg"
-
-if args[1] == "setoffset" then
-  local v = tonumber(args[2])
-  if not v then print("usage: minimap setoffset <degrees>") return end
-  local f = fs.open(CONFIG_FILE, "w")
-  f.write(textutils.serialiseJSON({ headingOffset = v }))
-  f.close()
-  print("wrote " .. CONFIG_FILE .. " headingOffset=" .. v)
-  return
-end
-
 local SERVER = "http://your-host.example.com:5055"
 local PLAYER_NAME = "YourPlayerName"
 local NAV_PERIPHERAL = nil
@@ -36,10 +24,15 @@ local WAYPOINT_BITS = 0x0C
 
 local NAV_TYPES   = { "navigation_table", "ship_navigation_table", "compass" }
 local NAV_METHODS = { "getRelativeAngle", "getYaw", "getRotationYaw", "getRotation" }
--- Degrees added to the raw nav reading. Persisted across reinstalls in
--- minimap.cfg (set with: minimap setoffset <degrees>).
+-- Degrees added to the raw nav reading. Stored in minimap.cfg so it
+-- survives reinstalls. Edit the file directly: edit minimap.cfg
 local HEADING_OFFSET_DEG = 0
-if fs.exists(CONFIG_FILE) then
+if not fs.exists(CONFIG_FILE) then
+  local f = fs.open(CONFIG_FILE, "w")
+  f.write('{ "headingOffset": 0 }\n')
+  f.close()
+end
+do
   local f = fs.open(CONFIG_FILE, "r")
   local raw = f and f.readAll() or ""
   if f then f.close() end
