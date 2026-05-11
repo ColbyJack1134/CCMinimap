@@ -19,7 +19,11 @@ if not fs.exists(CONFIG_FILE) then
   f.write([[{
   "headingOffset": 0,
   "needleLength": 5,
-  "controlSides": { "forward": "back", "back": "top", "left": "left", "right": "right" }
+  "controlSides": { "forward": "back", "back": "top", "left": "left", "right": "right" },
+  "showAltitudeTape": true,
+  "showSpeedDial": true,
+  "maxAltitude": 320,
+  "maxSpeed": 5
 }
 ]])
   f.close()
@@ -47,6 +51,13 @@ local CONTROL_SIDES = {
   right   = cfgSide("right",   "right"),
 }
 local relay = peripheral.find("redstone_relay")
+local altSensor = peripheral.find("altitude_sensor")
+local velSensor = peripheral.find("velocity_sensor")
+
+local SHOW_ALT_TAPE   = (cfg.showAltitudeTape ~= false)
+local SHOW_SPEED_DIAL = (cfg.showSpeedDial ~= false)
+local MAX_ALT   = tonumber(cfg.maxAltitude) or 320
+local MAX_SPEED = tonumber(cfg.maxSpeed) or 5
 local NEEDLE_AREA_W = 2 * math.ceil(NEEDLE_LENGTH_SUB / SUB_W) + 1
 local NEEDLE_AREA_H = 2 * math.ceil(NEEDLE_LENGTH_SUB / SUB_H) + 1
 
@@ -76,6 +87,9 @@ local state = {
   autoStatus = "",      -- short status string for the auto bar
   controls = {},        -- intended redstone state per channel; pending hardware
   targetCells = {},     -- list of clickable target hitboxes built each frame
+  altitude = nil, pressure = nil, velocity = nil,
+  lastTapeCells = {},   -- cell keys we lit last tape draw, restored next frame
+  lastDialCells = {},   -- same idea for the speedometer needle
   status = "starting",
   running = true,
   players = {},
@@ -401,9 +415,103 @@ local function overlayDotTrail(cx, cz, mapH)
   end
 end
 
--- Channels: "forward", "left", "right", "back". Side mapping comes from
--- minimap.cfg controlSides. If no relay is attached, we still record the
--- intended state for the auto bar to display.
+local function readAltitude()
+  if not altSensor then return nil end
+  local ok, h = pcall(altSensor.getHeight)
+  if ok and type(h) == "number" then return h end
+end
+local function readPressure()
+  if not altSensor then return nil end
+  local ok, pr = pcall(altSensor.getAirPressure)
+  if ok and type(pr) == "number" then return pr end
+end
+local function readVelocity()
+  if not velSensor then return nil end
+  local ok, v = pcall(velSensor.getVelocity)
+  if ok and type(v) == "number" then return v end
+end
+
+-- Altitude tape on the rightmost column. Only cells with a tick or the
+-- current-altitude indicator get painted; the rest stay terrain (so the tape
+-- doesn't black out the right edge of the map).
+local function overlayAltitudeTape(mapH)
+  for key in pairs(state.lastTapeCells) do
+    local c = math.floor(key / 1024)
+    local r = key - c * 1024
+    overlayCell(c, r, 0, "0", mapH, true)
+  end
+  state.lastTapeCells = {}
+  if not SHOW_ALT_TAPE or not state.altitude then return end
+  local col = width
+  local altRatio = math.max(0, math.min(1, state.altitude / MAX_ALT))
+  local cells = {}
+  local function setSub(p, color, prio)
+    if p < 0 or p >= mapH * SUB_H then return end
+    local row = math.floor(p / SUB_H) + 1
+    local sy = p - (row - 1) * SUB_H
+    cells[row] = cells[row] or { pattern = 0, color = color, prio = prio }
+    cells[row].pattern = bit32.bor(cells[row].pattern,
+      bit32.lshift(1, sy * SUB_W), bit32.lshift(1, sy * SUB_W + 1))
+    if prio > cells[row].prio then
+      cells[row].color = color; cells[row].prio = prio
+    end
+  end
+  for tick = 1, 3 do
+    setSub(math.floor(tick / 4 * (mapH * SUB_H - 1) + 0.5), "8", 1)
+  end
+  local indP = math.floor((1 - altRatio) * (mapH * SUB_H - 1) + 0.5)
+  for d = -1, 1 do setSub(indP + d, "1", 2) end
+  for row, c in pairs(cells) do
+    overlayCell(col, row, c.pattern, c.color, mapH, true)
+    state.lastTapeCells[col * 1024 + row] = true
+  end
+end
+
+-- Speedometer needle in a 3x3 cell area at top-right (just left of the tape).
+-- Sweep: 0 speed = needle points left, max = points right, mid = up.
+-- Only cells the needle passes through get painted.
+local function overlaySpeedDial(mapH)
+  for key in pairs(state.lastDialCells) do
+    local c = math.floor(key / 1024)
+    local r = key - c * 1024
+    overlayCell(c, r, 0, "0", mapH, true)
+  end
+  state.lastDialCells = {}
+  if not SHOW_SPEED_DIAL or not state.velocity then return end
+  local centerCol = width - 2
+  local centerRow = 3
+  local lengthSub = 3
+  local ratio = math.max(0, math.min(1, state.velocity / MAX_SPEED))
+  local rad = math.rad((ratio - 0.5) * 180)
+  local dx = math.sin(rad); local dy = -math.cos(rad)
+  local centerSubX = (centerCol - 1) * SUB_W + (SUB_W - 1) / 2
+  local centerSubY = (centerRow - 1) * SUB_H + (SUB_H - 1) / 2
+  local cells = {}
+  local steps = lengthSub * 5
+  for i = 0, steps do
+    local t = i / steps
+    local sxR = math.floor(centerSubX + dx * lengthSub * t + 0.5)
+    local syR = math.floor(centerSubY + dy * lengthSub * t + 0.5)
+    local col = math.floor(sxR / SUB_W) + 1
+    local row = math.floor(syR / SUB_H) + 1
+    local sx = sxR - (col - 1) * SUB_W
+    local sy = syR - (row - 1) * SUB_H
+    if sx >= 0 and sx < SUB_W and sy >= 0 and sy < SUB_H then
+      local key = col * 1024 + row
+      cells[key] = bit32.bor(cells[key] or 0, bit32.lshift(1, sy * SUB_W + sx))
+    end
+  end
+  for key, bits in pairs(cells) do
+    local col = math.floor(key / 1024)
+    local row = key - col * 1024
+    if col >= 1 and col <= width and row >= 1 and row <= mapH then
+      overlayCell(col, row, bits, "1", mapH, true)
+      state.lastDialCells[key] = true
+    end
+  end
+end
+
+-- Channels: "forward", "left", "right", "back". Side mapping from minimap.cfg.
 local function setControl(name, on)
   on = on and true or false
   state.controls[name] = on
@@ -471,6 +579,9 @@ end
 
 local function drawOsd(x, y, z)
   local osdY = height
+  monitor.setCursorPos(1, osdY)
+  monitor.setBackgroundColor(colors.black)
+  monitor.clearLine()
   buttons = {}
   drawButton("zoom_in", 1, osdY, " + ")
   drawButton("zoom_out", 5, osdY, " - ")
@@ -484,8 +595,11 @@ local function drawOsd(x, y, z)
     local pcol, prow = worldToCell(pp.position.x, pp.position.z, state.lastPos.x, state.lastPos.z, mapH)
     pInfo = pInfo .. ":" .. pcol .. "," .. prow
   end
-  local coord = string.format("X%d Z%d H%s B%s %s",
-    x, z, headingStr, tostring(state.bpp), pInfo)
+  local extras = ""
+  if state.velocity then extras = extras .. string.format(" S%.1f", state.velocity) end
+  if state.altitude then extras = extras .. string.format(" A%d", math.floor(state.altitude + 0.5)) end
+  local coord = string.format("X%d Z%d H%s B%s %s%s",
+    x, z, headingStr, tostring(state.bpp), pInfo, extras)
   local startCol = math.max(13, width - #coord + 1)
   drawText(startCol, osdY, coord:sub(1, width - startCol + 1), colors.white, colors.black)
   if state.lastError then
@@ -530,6 +644,8 @@ local function fullRedraw()
   overlayDotTrail(state.lastPos.x, state.lastPos.z, mapH)
   overlayWaypoints(state.lastPos.x, state.lastPos.z, mapH)
   overlayOtherPlayers(state.lastPos.x, state.lastPos.z, mapH)
+  overlayAltitudeTape(mapH)
+  overlaySpeedDial(mapH)
   overlaySelfTriangle(state.shipHeading, mapH)
   drawOsd(math.floor(state.lastPos.x), math.floor(state.lastPos.y), math.floor(state.lastPos.z))
   drawAutoBar()
@@ -566,9 +682,14 @@ end
 local function fastTick()
   local h = readHeading()
   if h then state.shipHeading = h end
+  state.altitude = readAltitude()
+  state.pressure = readPressure()
+  state.velocity = readVelocity()
   autopilotTick()
   if state.lastFrame and state.lastPos then
     local mapH = math.max(3, height - 1)
+    overlayAltitudeTape(mapH)
+    overlaySpeedDial(mapH)
     overlaySelfTriangle(state.shipHeading, mapH)
     drawOsd(math.floor(state.lastPos.x), math.floor(state.lastPos.y), math.floor(state.lastPos.z))
     drawAutoBar()
