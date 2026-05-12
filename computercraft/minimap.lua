@@ -446,39 +446,58 @@ local function overlaySelfTriangle(heading, mapH)
 
   local centerCol = math.floor(width / 2 + 0.5)
   local centerRow = math.floor(mapH / 2 + 0.5)
-  -- Sub-pixel coordinate of the center cells geometric center
   local centerSubX = (centerCol - 1) * SUB_W + (SUB_W - 1) / 2
   local centerSubY = (centerRow - 1) * SUB_H + (SUB_H - 1) / 2
 
-  -- Walk the needle in fine steps, mark each sub-pixel into a per-cell bitmap.
-  local cells = {}
-  local steps = NEEDLE_LENGTH_SUB * 5
-  for i = 0, steps do
-    local t = i / steps
-    local sxAbs = centerSubX + dx * NEEDLE_LENGTH_SUB * t
-    local syAbs = centerSubY + dy * NEEDLE_LENGTH_SUB * t
-    local sxR = math.floor(sxAbs + 0.5)
-    local syR = math.floor(syAbs + 0.5)
+  local function lightSub(map, sxR, syR)
     local col = math.floor(sxR / SUB_W) + 1
     local row = math.floor(syR / SUB_H) + 1
     local sx = sxR - (col - 1) * SUB_W
     local sy = syR - (row - 1) * SUB_H
     if sx >= 0 and sx < SUB_W and sy >= 0 and sy < SUB_H then
       local key = col * 1024 + row
-      cells[key] = bit32.bor(cells[key] or 0, bit32.lshift(1, sy * SUB_W + sx))
+      map[key] = bit32.bor(map[key] or 0, bit32.lshift(1, sy * SUB_W + sx))
     end
   end
 
-  -- Tip cell: where the very last sub-pixel sits, colored differently so
-  -- the head of the needle is distinguishable from the base.
-  local tipSxR = math.floor(centerSubX + dx * NEEDLE_LENGTH_SUB + 0.5)
-  local tipSyR = math.floor(centerSubY + dy * NEEDLE_LENGTH_SUB + 0.5)
-  local tipCol = math.floor(tipSxR / SUB_W) + 1
-  local tipRow = math.floor(tipSyR / SUB_H) + 1
-  local tipKey = tipCol * 1024 + tipRow
+  -- Walk the needle in fine steps, mark each sub-pixel into a per-cell bitmap.
+  local needleCells = {}
+  local steps = NEEDLE_LENGTH_SUB * 5
+  for i = 0, steps do
+    local t = i / steps
+    local sxR = math.floor(centerSubX + dx * NEEDLE_LENGTH_SUB * t + 0.5)
+    local syR = math.floor(centerSubY + dy * NEEDLE_LENGTH_SUB * t + 0.5)
+    lightSub(needleCells, sxR, syR)
+  end
 
-  -- Re-blit the area around the center: cells on the needle get the stencil
-  -- bits, the rest restore from cache (overlayCell with stenBits=0 path).
+  -- Dark base mark at the needle root. Snap to 8 octants so cardinals get a
+  -- 3-px cross (perp + behind) and diagonals get a 2-px L (one orthogonal
+  -- pixel behind the base + one diagonally adjacent further behind it).
+  local baseSxR = math.floor(centerSubX + 0.5)
+  local baseSyR = math.floor(centerSubY + 0.5)
+  local octant = math.floor(((((heading or 0) % 360) + 22.5) % 360) / 45)
+  local crossOffsets
+  if     octant == 0 then crossOffsets = { {-1, 0}, {1, 0}, {0, 1} }   -- N
+  elseif octant == 2 then crossOffsets = { {0, -1}, {0, 1}, {-1, 0} }  -- E
+  elseif octant == 4 then crossOffsets = { {-1, 0}, {1, 0}, {0, -1} }  -- S
+  elseif octant == 6 then crossOffsets = { {0, -1}, {0, 1}, {1, 0} }   -- W
+  elseif octant == 1 then crossOffsets = { {-1, 0}, {-1, 1} }          -- NE
+  elseif octant == 3 then crossOffsets = { {-1, 0}, {-1, -1} }         -- SE
+  elseif octant == 5 then crossOffsets = { {1, 0}, {1, -1} }           -- SW
+  else                    crossOffsets = { {1, 0}, {1, 1} }            -- NW
+  end
+  local baseCells = {}
+  for _, o in ipairs(crossOffsets) do
+    lightSub(baseCells, baseSxR + o[1], baseSyR + o[2])
+  end
+
+  -- Re-blit each cell in the marker area. Cases:
+  --   needle bits AND base bits  -> FG=red, BG=dark. Cell loses terrain bg
+  --     and becomes a small anchor block, but base sub-pixels render as
+  --     intended and the conflict on the centre cell is resolved.
+  --   needle only -> red over the cached map cell bg
+  --   base only   -> dark over the cached map cell bg
+  --   neither     -> restore the cached cell
   local startCol = centerCol - math.floor(NEEDLE_AREA_W / 2)
   local startRow = centerRow - math.floor(NEEDLE_AREA_H / 2)
   for r = 0, NEEDLE_AREA_H - 1 do
@@ -486,8 +505,26 @@ local function overlaySelfTriangle(heading, mapH)
       local col = startCol + c
       local row = startRow + r
       local key = col * 1024 + row
-      local color = (key == tipKey) and "2" or "0"
-      overlayCell(col, row, cells[key] or 0, color, mapH, true)
+      local redBits = needleCells[key] or 0
+      local darkBits = bit32.band(baseCells[key] or 0, bit32.bnot(redBits))
+      if redBits ~= 0 and darkBits ~= 0 then
+        -- drawMarkerCell is defined lower in the file; inline its body.
+        if col >= 1 and col <= width and row >= 1 and row <= mapH then
+          local pattern, fg, bg = redBits, "2", "7"
+          if bit32.band(pattern, 0x20) ~= 0 then
+            pattern = bit32.bxor(pattern, 0x3F)
+            fg, bg = bg, fg
+          end
+          monitor.setCursorPos(col, row)
+          monitor.blit(string.char(pattern + 0x80), fg, bg)
+        end
+      elseif redBits ~= 0 then
+        overlayCell(col, row, redBits, "2", mapH, true)
+      elseif darkBits ~= 0 then
+        overlayCell(col, row, darkBits, "7", mapH, true)
+      else
+        overlayCell(col, row, 0, "0", mapH, true)
+      end
     end
   end
 end
