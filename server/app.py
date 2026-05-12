@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import os
 import time
 
@@ -139,6 +140,48 @@ def create_app() -> Flask:
     @app.get("/waypoints")
     def waypoints():
         return jsonify(_file_waypoints() + _bm_marker_waypoints())
+
+    @app.get("/height")
+    def height():
+        try:
+            def number(name, default, lo, hi):
+                raw = request.args.get(name, default)
+                v = float(raw)
+                if v < lo or v > hi:
+                    raise ValueError(f"{name} out of range [{lo}, {hi}]")
+                return v
+            x = number("x", 0.0, -30_000_000, 30_000_000)
+            z = number("z", 0.0, -30_000_000, 30_000_000)
+            r = int(number("r", 1, 0, 8))
+            result = client.sample_ground_height(x, z, chunk_radius=r)
+            result["x"] = x
+            result["z"] = z
+            return jsonify(result)
+        except ValueError as error:
+            return jsonify({"error": str(error)}), 400
+        except BlueMapError as error:
+            return jsonify({"error": str(error)}), 502
+        except RequestException as error:
+            return jsonify({"error": f"BlueMap request failed: {error}"}), 502
+
+    @app.get("/startup.lua")
+    def startup_lua():
+        return send_file("/app/computercraft/startup.lua", mimetype="text/plain; charset=utf-8")
+
+    @app.get("/config.defaults")
+    def config_defaults():
+        try:
+            with open("/app/computercraft/minimap.lua") as f:
+                lua = f.read()
+        except OSError as error:
+            return jsonify({"error": str(error)}), 500
+        match = re.search(r"f\.write\(\[\[(.+?)\]\]\)", lua, re.DOTALL)
+        if not match:
+            return jsonify({"error": "no default config block found"}), 500
+        try:
+            return jsonify(json.loads(match.group(1)))
+        except json.JSONDecodeError as error:
+            return jsonify({"error": f"default config is not valid JSON: {error}"}), 500
 
     @app.get("/minimap.lua")
     def minimap_lua():
