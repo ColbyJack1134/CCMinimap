@@ -1,4 +1,9 @@
-local CONFIG_FILE = "minimap.cfg"
+-- This file runs as both the ship-side minimap (full autopilot) and the pocket
+-- client (thin remote that mirrors state and forwards taps over rednet). The
+-- branch point is `IS_POCKET = pocket ~= nil`. The server hosts the file at
+-- /minimap.lua (ship) and /minimap-pocket.lua (pocket) -- same content.
+local IS_POCKET = pocket ~= nil
+local CONFIG_FILE = IS_POCKET and "minimap-pocket.cfg" or "minimap.cfg"
 local SERVER = "http://your-host.example.com:5055"
 local PLAYER_NAME = "YourPlayerName"
 local NAV_PERIPHERAL = nil
@@ -6,6 +11,17 @@ local NAV_METHOD = nil
 local FRAME_INTERVAL = 1.0
 local NAV_INTERVAL = 0.1
 local SIDECAR_INTERVAL = 2.5
+
+-- Rednet protocols. Ship hosts as SHIP_HOST on SHIP_PROTO so pockets can find
+-- it via rednet.lookup. State is broadcast on STATE_PROTOCOL; commands flow
+-- back on CMD_PROTOCOL.
+local SHIP_PROTO              = "ship-control"
+local SHIP_HOST               = "airship"
+local STATE_PROTOCOL          = "airship-state"
+local CMD_PROTOCOL            = "airship-cmd"
+local STATE_BROADCAST_INTERVAL = 0.5
+local LOOKUP_RETRY_INTERVAL    = 2.0
+local STATE_STALE_AFTER        = 3.0
 
 local SUB_W, SUB_H = 2, 3
 
@@ -103,6 +119,22 @@ end
 local altSensor = peripheral.find("altitude_sensor")
 local velSensor = peripheral.find("velocity_sensor")
 
+-- Modem for ship<->pocket rednet. Auto-find on any side (or via wired modem
+-- network). Ship registers itself; pockets will rednet.lookup it.
+local modemName
+do
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "modem" then
+      if not rednet.isOpen(name) then pcall(rednet.open, name) end
+      modemName = name
+      break
+    end
+  end
+end
+if modemName and not IS_POCKET then
+  pcall(rednet.host, SHIP_PROTO, SHIP_HOST)
+end
+
 local SHOW_ALT_TAPE   = (cfg.showAltitudeTape ~= false)
 local SHOW_SPEED_DIAL = (cfg.showSpeedDial ~= false)
 local MAX_ALT   = tonumber(cfg.maxAltitude) or 320
@@ -159,15 +191,14 @@ local state = {
   altHoldTarget = nil,
   landRampStart = nil,      -- os.clock() when LAND phase began
   landRampStartLevel = nil, -- burner level snapshot at LAND entry
-  descending = false,       -- ALT toggled off -> ramp to landBurnerLevel
-  descendStart = nil,
-  descendStartLevel = nil,
   groundY = nil,        -- max surface Y in sampled chunk window (from BlueMap)
   groundYMin = nil,     -- min surface Y in same window
   lastTapeCells = {},   -- cell keys we lit last tape draw, restored next frame
   lastTapeAlt = nil,    -- altitude value last drawn on tape (for skip-if-unchanged)
   lastTapeGround = nil, -- ground value last drawn on tape
   lastBurnerLevel = nil,-- burner level last drawn on tape marker
+  shipId = nil,         -- pocket: rednet id of the ship after lookup
+  lastUpdateAt = 0,     -- pocket: os.clock() when last state broadcast received
   lastDialCells = {},   -- same idea for the speedometer needle
   status = "starting",
   running = true,
@@ -190,6 +221,16 @@ local monitor = findMonitor()
 if monitor.setTextScale then monitor.setTextScale(0.5) end
 local width, height = monitor.getSize()
 local unpackValues = table.unpack or unpack
+
+-- The pocket has a tight 26x20 screen, so its OSD uses two rows: buttons on
+-- height-1, coord/status on height. The ship's monitor keeps the one-row OSD.
+local function mapHeight()
+  return math.max(3, height - (IS_POCKET and 2 or 1))
+end
+
+local function isStale()
+  return IS_POCKET and (os.clock() - (state.lastUpdateAt or 0)) > STATE_STALE_AFTER
+end
 
 local function clamp(v, lo, hi)
   if v < lo then return lo end
@@ -281,12 +322,11 @@ local info = httpGetJson(SERVER .. "/info")
 if info and info.palette then applyPalette(info.palette) end
 
 local function buildUrl(x, z)
-  local mapHeight = math.max(3, height - 1)
   return SERVER .. "/frame?" .. table.concat({
     "x=" .. urlencode(math.floor(x * 10) / 10),
     "z=" .. urlencode(math.floor(z * 10) / 10),
     "w=" .. urlencode(width),
-    "h=" .. urlencode(mapHeight),
+    "h=" .. urlencode(mapHeight()),
     "bpp=" .. urlencode(state.bpp),
     "lod=" .. urlencode(state.lod),
   }, "&")
@@ -854,12 +894,6 @@ local function updatePhase()
     return
   end
 
-  if state.phase == "STOP_AND_RISE" then
-    if agl and agl >= MIN_ALT_AGL + RECOVER_MARGIN then state.phase = "CRUISE" end
-    return
-  end
-  if agl and agl < MIN_ALT_AGL then state.phase = "STOP_AND_RISE"; return end
-
   if state.phase == "CLIMB_TO_CRUISE" then
     if agl and agl >= CRUISE_ALT_AGL - CLIMB_DONE_MARGIN then state.phase = "CRUISE" end
     return
@@ -875,16 +909,14 @@ local function updatePhase()
 end
 
 local function altitudeController()
-  -- Auto-exit descent once the ship has effectively landed.
-  if state.descending and state.altitude and state.groundY
-      and (state.altitude - state.groundY) < LANDED_ALT_MARGIN
-      and math.abs(state.vy or 0) < LANDED_VY_THRESH then
-    state.descending = false
-    state.descendStart = nil
-    state.descendStartLevel = nil
-  end
-
-  if not state.engaged and not state.altHoldActive and not state.descending then
+  if not state.engaged and not state.altHoldActive then
+    -- Idle: hand the burner back to the manual +/- controller on the same
+    -- signals. Drop any in-flight pulse and force the outputs LOW so we
+    -- never fight a person holding the button.
+    pulseState.liftUp = nil
+    pulseState.liftDown = nil
+    if state.controls.liftUp then setControl("liftUp", false) end
+    if state.controls.liftDown then setControl("liftDown", false) end
     return
   end
   if not state.altitude or not state.burnerLevel then return end
@@ -893,11 +925,6 @@ local function altitudeController()
   if state.engaged and state.phase == "LAND" and state.landRampStart then
     local t = os.clock() - state.landRampStart
     local startLvl = state.landRampStartLevel or HOVER_BURNER
-    local frac = math.min(1, t / math.max(0.001, LAND_RAMP_S))
-    desired = math.floor(startLvl + (LAND_BURNER - startLvl) * frac + 0.5)
-  elseif state.descending and state.descendStart then
-    local t = os.clock() - state.descendStart
-    local startLvl = state.descendStartLevel or HOVER_BURNER
     local frac = math.min(1, t / math.max(0.001, LAND_RAMP_S))
     desired = math.floor(startLvl + (LAND_BURNER - startLvl) * frac + 0.5)
   else
@@ -929,11 +956,6 @@ local function horizontalController()
   if state.phase == "CLIMB_TO_CRUISE" then
     setControl("forward", false); setControl("left", false); setControl("right", false)
     state.autoStatus = "CLIMB"
-    return
-  end
-  if state.phase == "STOP_AND_RISE" then
-    setControl("forward", false); setControl("left", false); setControl("right", false)
-    state.autoStatus = "STOP+CLIMB"
     return
   end
   if state.phase == "LAND" then
@@ -980,37 +1002,43 @@ local function drawButton(id, x, y, label)
 end
 
 local function drawOsd(x, y, z)
-  local osdY = height
-  monitor.setCursorPos(1, osdY)
-  monitor.setBackgroundColor(colors.black)
-  monitor.clearLine()
+  local btnRow, coordRow
+  if IS_POCKET then
+    btnRow = height - 1
+    coordRow = height
+    monitor.setCursorPos(1, btnRow); monitor.setBackgroundColor(colors.black); monitor.clearLine()
+    monitor.setCursorPos(1, coordRow); monitor.setBackgroundColor(colors.black); monitor.clearLine()
+  else
+    btnRow = height
+    coordRow = height
+    monitor.setCursorPos(1, btnRow); monitor.setBackgroundColor(colors.black); monitor.clearLine()
+  end
   buttons = {}
   local col = 1
-  drawButton("zoom_in", col, osdY, " + "); col = col + 3
-  drawButton("zoom_out", col, osdY, " - "); col = col + 3
-  drawButton("lod", col, osdY, " L" .. state.lod); col = col + 3
+  drawButton("zoom_in", col, btnRow, " + "); col = col + 3
+  drawButton("zoom_out", col, btnRow, " - "); col = col + 3
+  drawButton("lod", col, btnRow, " L" .. state.lod); col = col + 3
   local altLabel = state.altHoldActive and " ALT* " or " ALT "
-  drawButton("alt", col, osdY, altLabel); col = col + #altLabel
+  drawButton("alt", col, btnRow, altLabel); col = col + #altLabel
   if state.target then
     col = col + 1
     local autoLabel = state.engaged and " STOP " or " AUTO "
-    drawButton("auto", col, osdY, autoLabel); col = col + #autoLabel
-    drawButton("clear_target", col, osdY, " X "); col = col + 3
+    drawButton("auto", col, btnRow, autoLabel); col = col + #autoLabel
+    drawButton("clear_target", col, btnRow, " X "); col = col + 3
   end
-  local headingStr = nav and tostring(math.floor((state.shipHeading or 0) + 0.5)) or "--"
+  local headingStr = (state.shipHeading and tostring(math.floor((state.shipHeading or 0) + 0.5))) or "--"
   local pCount = #(state.players or {})
   local pInfo = "P" .. pCount
-  if state.lastFrame and state.lastPos and state.players[1] and state.players[1].position then
+  if not IS_POCKET and state.lastFrame and state.lastPos and state.players[1] and state.players[1].position then
     local pp = state.players[1]
-    local mapH = math.max(3, height - 1)
-    local pcol, prow = worldToCell(pp.position.x, pp.position.z, state.lastPos.x, state.lastPos.z, mapH)
+    local pcol, prow = worldToCell(pp.position.x, pp.position.z, state.lastPos.x, state.lastPos.z, mapHeight())
     pInfo = pInfo .. ":" .. pcol .. "," .. prow
   end
   local extras = ""
   if state.velocity then extras = extras .. string.format(" S%.1f", state.velocity) end
   if state.altitude then extras = extras .. string.format(" A%d", math.floor(state.altitude + 0.5)) end
   if state.burnerLevel then extras = extras .. string.format(" Bn%d", state.burnerLevel) end
-  if state.descending then extras = extras .. " DESC" end
+  if isStale() then extras = extras .. " STALE" end
   local coord
   if state.target then
     local dx = (state.target.x or 0) - (state.lastPos and state.lastPos.x or 0)
@@ -1023,8 +1051,12 @@ local function drawOsd(x, y, z)
     coord = string.format("X%d Z%d H%s B%s %s%s",
       x, z, headingStr, tostring(state.bpp), pInfo, extras)
   end
-  local startCol = math.max(col + 1, width - #coord + 1)
-  drawText(startCol, osdY, coord:sub(1, width - startCol + 1), colors.white, colors.black)
+  if IS_POCKET then
+    drawText(1, coordRow, coord:sub(1, width), colors.white, colors.black)
+  else
+    local startCol = math.max(col + 1, width - #coord + 1)
+    drawText(startCol, coordRow, coord:sub(1, width - startCol + 1), colors.white, colors.black)
+  end
   if state.lastError then
     monitor.setCursorPos(1, 1)
     monitor.setTextColor(colors.red)
@@ -1070,7 +1102,7 @@ local function fullRedraw()
       end
     end
   end
-  local mapH = math.max(3, height - 1)
+  local mapH = mapHeight()
   state.targetCells = {}
   drawCachedMap(mapH)
   -- Map underneath changed; force tape to repaint regardless of skip guard.
@@ -1082,28 +1114,31 @@ local function fullRedraw()
   overlayWaypoints(state.lastPos.x, state.lastPos.z, mapH)
   overlayOtherPlayers(state.lastPos.x, state.lastPos.z, mapH)
   overlayAltitudeTape(mapH)
-  overlaySpeedDial(mapH)
+  if not IS_POCKET then overlaySpeedDial(mapH) end
   overlaySelfTriangle(state.shipHeading, mapH)
-  drawOsd(math.floor(state.lastPos.x), math.floor(state.lastPos.y), math.floor(state.lastPos.z))
+  drawOsd(math.floor(state.lastPos.x), math.floor(state.lastPos.y or 0), math.floor(state.lastPos.z))
 end
 
 local function mapTick()
   maybeFetchSidecar()
-  local x, y, z = gps.locate(0.5)
-  if x then
-    local data, err = httpGetJson(buildUrl(x, z))
-    if data and data.text then
-      state.status = "ok"
-      state.lastFrame = data
-      state.lastPos = { x = x, y = y or 0, z = z }
-      fullRedraw()
-    elseif data and data.error then
-      drawError(data.error)
-    else
-      drawError(err or "http.get failed")
-    end
+  if not IS_POCKET then
+    local x, y, z = gps.locate(0.5)
+    if not x then drawError("No GPS lock"); return end
+    state.lastPos = { x = x, y = y or 0, z = z }
+  end
+  if not state.lastPos then
+    drawError(state.shipId and "Waiting for ship state..." or "Looking for ship...")
+    return
+  end
+  local data, err = httpGetJson(buildUrl(state.lastPos.x, state.lastPos.z))
+  if data and data.text then
+    state.status = "ok"
+    state.lastFrame = data
+    fullRedraw()
+  elseif data and data.error then
+    drawError(data.error)
   else
-    drawError("No GPS lock")
+    drawError(err or "http.get failed")
   end
 end
 
@@ -1116,20 +1151,22 @@ local function mapLoop()
 end
 
 local function fastTick()
-  local h = readHeading()
-  if h then state.shipHeading = h end
-  state.altitude = readAltitude()
-  state.pressure = readPressure()
-  state.velocity = readVelocity()
-  updateVy()
-  updateBurnerLevel()
-  autopilotTick()
+  if not IS_POCKET then
+    local h = readHeading()
+    if h then state.shipHeading = h end
+    state.altitude = readAltitude()
+    state.pressure = readPressure()
+    state.velocity = readVelocity()
+    updateVy()
+    updateBurnerLevel()
+    autopilotTick()
+  end
   if state.lastFrame and state.lastPos then
-    local mapH = math.max(3, height - 1)
+    local mapH = mapHeight()
     overlayAltitudeTape(mapH)
-    overlaySpeedDial(mapH)
+    if not IS_POCKET then overlaySpeedDial(mapH) end
     overlaySelfTriangle(state.shipHeading, mapH)
-    drawOsd(math.floor(state.lastPos.x), math.floor(state.lastPos.y), math.floor(state.lastPos.z))
+    drawOsd(math.floor(state.lastPos.x), math.floor(state.lastPos.y or 0), math.floor(state.lastPos.z))
   end
 end
 
@@ -1141,67 +1178,80 @@ local function fastLoop()
   end
 end
 
-local function handleTouch(_, side, x, y)
-  local hit = false
-  for id, btn in pairs(buttons) do
-    if x >= btn.x1 and x <= btn.x2 and y >= btn.y1 and y <= btn.y2 then
-      hit = true
-      if id == "zoom_in" then
-        state.bpp = clamp(state.bpp / 2, 0.25, 128)
-        state.lod = pickLod(state.bpp)
-      elseif id == "zoom_out" then
-        state.bpp = clamp(state.bpp * 2, 0.25, 128)
-        state.lod = pickLod(state.bpp)
-      elseif id == "lod" then
-        state.lod = state.lod + 1
-        if state.lod > 3 then state.lod = 1 end
-      elseif id == "auto" then
-        if state.target then
-          state.engaged = not state.engaged
-          state.phase = nil
-          state.descending = false  -- AUTO press cancels any in-progress descent
-          state.descendStart = nil
-          state.descendStartLevel = nil
-          if not state.engaged then
-            setControl("forward", false); setControl("left", false); setControl("right", false)
-          end
-        end
-      elseif id == "alt" then
-        if state.altHoldActive then
-          -- Turning ALT off triggers a controlled descent to landBurnerLevel.
-          -- AUTO is canceled too -- the user is asking to come down now.
-          state.altHoldActive = false
-          state.altHoldTarget = nil
-          state.descending = true
-          state.descendStart = os.clock()
-          state.descendStartLevel = state.burnerLevel or HOVER_BURNER
-          if state.engaged then
-            state.engaged = false
-            state.phase = nil
-            setControl("forward", false); setControl("left", false); setControl("right", false)
-          end
-        else
-          state.altHoldActive = true
-          state.altHoldTarget = state.altitude
-          state.descending = false
-          state.descendStart = nil
-          state.descendStartLevel = nil
-        end
-      elseif id == "clear_target" then
-        state.target = nil
-        state.engaged = false
-        state.phase = nil
-        state.autoStatus = ""
+-- Mutates state in response to a UI command. Shared by the local touch handler
+-- and (on the ship) the rednet command listener, so a pocket tap and a monitor
+-- tap funnel through the same logic.
+local function applyCommand(cmd)
+  if type(cmd) ~= "table" then return end
+  local id = cmd.cmd
+  if id == "zoom_in" then
+    state.bpp = clamp(state.bpp / 2, 0.25, 128)
+    state.lod = pickLod(state.bpp)
+  elseif id == "zoom_out" then
+    state.bpp = clamp(state.bpp * 2, 0.25, 128)
+    state.lod = pickLod(state.bpp)
+  elseif id == "lod" then
+    state.lod = state.lod + 1
+    if state.lod > 3 then state.lod = 1 end
+  elseif id == "auto" then
+    if state.target then
+      state.engaged = not state.engaged
+      state.phase = nil
+      if not state.engaged then
         setControl("forward", false); setControl("left", false); setControl("right", false)
       end
     end
+  elseif id == "alt" then
+    if state.altHoldActive then
+      state.altHoldActive = false
+      state.altHoldTarget = nil
+    else
+      state.altHoldActive = true
+      state.altHoldTarget = state.altitude
+    end
+  elseif id == "clear_target" then
+    state.target = nil
+    state.engaged = false
+    state.phase = nil
+    state.autoStatus = ""
+    setControl("forward", false); setControl("left", false); setControl("right", false)
+  elseif id == "set_target" and type(cmd.target) == "table" then
+    state.target = {
+      kind = cmd.target.kind,
+      name = cmd.target.name,
+      x = cmd.target.x,
+      z = cmd.target.z,
+      color = cmd.target.color,
+    }
+    state.engaged = false
+    state.autoStatus = ""
   end
-  if hit then return end
+end
+
+-- Pocket forwards every command to the ship over rednet. Ship applies locally.
+local function dispatchCommand(cmd)
+  if IS_POCKET then
+    if state.shipId then
+      pcall(rednet.send, state.shipId, cmd, CMD_PROTOCOL)
+    end
+  else
+    applyCommand(cmd)
+  end
+end
+
+local function handleTouch(_, side, x, y)
+  for id, btn in pairs(buttons) do
+    if x >= btn.x1 and x <= btn.x2 and y >= btn.y1 and y <= btn.y2 then
+      dispatchCommand({ cmd = id })
+      return
+    end
+  end
   for _, t in ipairs(state.targetCells or {}) do
     if y == t.row and x >= t.col1 and x <= t.col2 then
-      state.target = { kind = t.kind, name = t.name, x = t.x, z = t.z, color = t.color }
-      state.engaged = false
-      state.autoStatus = ""
+      dispatchCommand({
+        cmd = "set_target",
+        target = { kind = t.kind, name = t.name, x = t.x, z = t.z, color = t.color },
+      })
       return
     end
   end
@@ -1210,7 +1260,7 @@ end
 local function eventLoop()
   while state.running do
     local event = { os.pullEvent() }
-    if event[1] == "monitor_touch" then
+    if event[1] == "monitor_touch" or event[1] == "mouse_click" then
       handleTouch(unpackValues(event))
     elseif event[1] == "term_resize" then
       width, height = monitor.getSize()
@@ -1220,7 +1270,71 @@ local function eventLoop()
   end
 end
 
+-- Ship: broadcast a state snapshot every STATE_BROADCAST_INTERVAL and apply
+-- inbound commands. Pocket: lookup the ship and consume its state broadcasts.
+local function rednetLoop()
+  if not modemName then
+    while state.running do sleep(1) end
+    return
+  end
+  if IS_POCKET then
+    while state.running do
+      if not state.shipId then
+        state.shipId = rednet.lookup(SHIP_PROTO, SHIP_HOST)
+        if not state.shipId then sleep(LOOKUP_RETRY_INTERVAL) end
+      else
+        local id, msg = rednet.receive(STATE_PROTOCOL, 1.0)
+        if id == state.shipId and type(msg) == "table" then
+          if msg.lastPos then state.lastPos = msg.lastPos end
+          state.shipHeading   = msg.shipHeading or state.shipHeading
+          state.altitude      = msg.altitude
+          state.burnerLevel   = msg.burnerLevel
+          state.velocity      = msg.velocity
+          state.vy            = msg.vy
+          state.groundY       = msg.groundY
+          state.target        = msg.target
+          state.engaged       = msg.engaged
+          state.altHoldActive = msg.altHoldActive
+          state.altHoldTarget = msg.altHoldTarget
+          state.phase         = msg.phase
+          state.autoStatus    = msg.autoStatus or ""
+          if msg.bpp then state.bpp = msg.bpp end
+          if msg.lod then state.lod = msg.lod end
+          state.lastUpdateAt = os.clock()
+        end
+      end
+    end
+  else
+    local nextBroadcast = 0
+    while state.running do
+      local id, msg = rednet.receive(CMD_PROTOCOL, 0.1)
+      if id and type(msg) == "table" then applyCommand(msg) end
+      if os.clock() >= nextBroadcast then
+        pcall(rednet.broadcast, {
+          lastPos       = state.lastPos,
+          shipHeading   = state.shipHeading,
+          altitude      = state.altitude,
+          burnerLevel   = state.burnerLevel,
+          velocity      = state.velocity,
+          vy            = state.vy,
+          groundY       = state.groundY,
+          target        = state.target,
+          engaged       = state.engaged,
+          altHoldActive = state.altHoldActive,
+          altHoldTarget = state.altHoldTarget,
+          phase         = state.phase,
+          autoStatus    = state.autoStatus,
+          bpp           = state.bpp,
+          lod           = state.lod,
+        }, STATE_PROTOCOL)
+        nextBroadcast = os.clock() + STATE_BROADCAST_INTERVAL
+      end
+    end
+  end
+end
+
 local function resetAllOutputs()
+  if IS_POCKET then return end
   for name in pairs(CHANNELS) do setControl(name, false) end
   for k in pairs(pulseState) do pulseState[k] = nil end
 end
@@ -1230,6 +1344,10 @@ monitor.clear()
 -- A pulse left HIGH by a previous shutdown would jam the burner. Clear every
 -- output before we start so the script always boots from a known state.
 resetAllOutputs()
-parallel.waitForAny(mapLoop, fastLoop, eventLoop)
+if modemName then
+  parallel.waitForAny(mapLoop, fastLoop, eventLoop, rednetLoop)
+else
+  parallel.waitForAny(mapLoop, fastLoop, eventLoop)
+end
 -- Clean exit: drop everything so a STOP after `q` doesn't leave a relay HIGH.
 resetAllOutputs()

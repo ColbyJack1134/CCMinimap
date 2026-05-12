@@ -187,6 +187,17 @@ def create_app() -> Flask:
     def minimap_lua():
         return send_file("/app/computercraft/minimap.lua", mimetype="text/plain; charset=utf-8")
 
+    @app.get("/minimap-pocket.lua")
+    def minimap_pocket_lua():
+        # Same file content as /minimap.lua; minimap.lua branches on pocket~=nil.
+        # Served under a second URL so the pocket can keep a distinct local
+        # filename and config file.
+        return send_file("/app/computercraft/minimap.lua", mimetype="text/plain; charset=utf-8")
+
+    @app.get("/startup-pocket.lua")
+    def startup_pocket_lua():
+        return send_file("/app/computercraft/startup-pocket.lua", mimetype="text/plain; charset=utf-8")
+
     return app
 
 
