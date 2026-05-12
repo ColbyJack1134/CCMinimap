@@ -68,8 +68,38 @@ if readFile("minimap.lua") ~= minimapShim then
   writeFile("minimap.lua", minimapShim)
 end
 
+-- Pretty-print a JSON-like Lua value with 2-space indent. Object keys are
+-- sorted alphabetically so the on-disk config is stable across boots.
+local function jsonPretty(value, indent)
+  indent = indent or 0
+  if type(value) ~= "table" then return textutils.serialiseJSON(value) end
+  local n, isArray = 0, true
+  for k, _ in pairs(value) do
+    n = n + 1
+    if type(k) ~= "number" or k ~= math.floor(k) or k < 1 then isArray = false end
+  end
+  if n == 0 then return "{}" end
+  local pad      = string.rep("  ", indent)
+  local innerPad = string.rep("  ", indent + 1)
+  if isArray and n == #value then
+    local parts = {}
+    for i = 1, n do parts[i] = innerPad .. jsonPretty(value[i], indent + 1) end
+    return "[\n" .. table.concat(parts, ",\n") .. "\n" .. pad .. "]"
+  end
+  local keys = {}
+  for k, _ in pairs(value) do keys[#keys + 1] = tostring(k) end
+  table.sort(keys)
+  local parts = {}
+  for i, k in ipairs(keys) do
+    parts[i] = innerPad .. textutils.serialiseJSON(k) .. ": " .. jsonPretty(value[k], indent + 1)
+  end
+  return "{\n" .. table.concat(parts, ",\n") .. "\n" .. pad .. "}"
+end
+
 -- 3. Merge any new default config keys into minimap-pocket.cfg without overwriting.
 -- Only pocket-relevant keys; the ship owns controller/peripheral tunables.
+-- Always re-serialize in pretty form so compact configs from earlier builds
+-- get auto-beautified.
 local defaults = fetchJson(SERVER .. "/config.defaults.pocket")
 if type(defaults) == "table" then
   local raw = readFile(CONFIG)
@@ -86,9 +116,12 @@ if type(defaults) == "table" then
       added[#added + 1] = k
     end
   end
-  if #added > 0 then
-    writeFile(CONFIG, textutils.serialiseJSON(current))
-    print("Added config defaults: " .. table.concat(added, ", "))
+  local serialized = jsonPretty(current) .. "\n"
+  if readFile(CONFIG) ~= serialized then
+    writeFile(CONFIG, serialized)
+    if #added > 0 then
+      print("Added config defaults: " .. table.concat(added, ", "))
+    end
   end
 end
 
