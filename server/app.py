@@ -6,7 +6,7 @@ import re
 import os
 import time
 
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, Response, jsonify, request, send_file
 from PIL import Image
 from requests import RequestException
 
@@ -164,9 +164,24 @@ def create_app() -> Flask:
         except RequestException as error:
             return jsonify({"error": f"BlueMap request failed: {error}"}), 502
 
+    # Placeholders the .lua files carry instead of hardcoded values; substituted
+    # here at serve time from the deployment's env. Keeps source clean and lets
+    # one server image serve many installs.
+    _CLIENT_SUBS = {
+        "__SERVER_URL__": os.environ.get("CLIENT_SERVER_URL", ""),
+        "__PLAYER_NAME__": os.environ.get("CLIENT_PLAYER_NAME", ""),
+    }
+
+    def serve_lua(path):
+        with open(path) as f:
+            content = f.read()
+        for marker, value in _CLIENT_SUBS.items():
+            content = content.replace(marker, value)
+        return Response(content, mimetype="text/plain; charset=utf-8")
+
     @app.get("/startup.lua")
     def startup_lua():
-        return send_file("/app/computercraft/startup.lua", mimetype="text/plain; charset=utf-8")
+        return serve_lua("/app/computercraft/startup.lua")
 
     @app.get("/config.defaults")
     def config_defaults():
@@ -183,20 +198,47 @@ def create_app() -> Flask:
         except json.JSONDecodeError as error:
             return jsonify({"error": f"default config is not valid JSON: {error}"}), 500
 
+    # Pocket cares about a tiny subset of the ship's config: just rendering bits.
+    # All controller/peripheral tunables (liftKp, channels, hoverBurnerLevel, ...)
+    # live on the ship and reach the pocket via rednet broadcasts.
+    _POCKET_KEYS = {
+        "needleLength",
+        "showAltitudeTape",
+        "maxAltitude",
+        "airshipName",     # must match ship's value to discover it
+        "controlSecret",   # must match ship's value to authenticate commands
+    }
+
+    @app.get("/config.defaults.pocket")
+    def config_defaults_pocket():
+        try:
+            with open("/app/computercraft/minimap.lua") as f:
+                lua = f.read()
+        except OSError as error:
+            return jsonify({"error": str(error)}), 500
+        match = re.search(r"f\.write\(\[\[(.+?)\]\]\)", lua, re.DOTALL)
+        if not match:
+            return jsonify({"error": "no default config block found"}), 500
+        try:
+            full = json.loads(match.group(1))
+        except json.JSONDecodeError as error:
+            return jsonify({"error": f"default config is not valid JSON: {error}"}), 500
+        return jsonify({k: v for k, v in full.items() if k in _POCKET_KEYS})
+
     @app.get("/minimap.lua")
     def minimap_lua():
-        return send_file("/app/computercraft/minimap.lua", mimetype="text/plain; charset=utf-8")
+        return serve_lua("/app/computercraft/minimap.lua")
 
     @app.get("/minimap-pocket.lua")
     def minimap_pocket_lua():
         # Same file content as /minimap.lua; minimap.lua branches on pocket~=nil.
         # Served under a second URL so the pocket can keep a distinct local
         # filename and config file.
-        return send_file("/app/computercraft/minimap.lua", mimetype="text/plain; charset=utf-8")
+        return serve_lua("/app/computercraft/minimap.lua")
 
     @app.get("/startup-pocket.lua")
     def startup_pocket_lua():
-        return send_file("/app/computercraft/startup-pocket.lua", mimetype="text/plain; charset=utf-8")
+        return serve_lua("/app/computercraft/startup-pocket.lua")
 
     return app
 

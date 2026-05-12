@@ -1,7 +1,8 @@
 -- Self-updating boot: pulls latest startup.lua and minimap.lua from the server,
 -- merges any new default config keys without overwriting existing ones, then
 -- launches minimap. Network failures are non-fatal -- whatever is on disk runs.
-local SERVER = "http://your-host.example.com:5055"
+-- __SERVER_URL__ is substituted by the server (app.py) from CLIENT_SERVER_URL.
+local SERVER = "__SERVER_URL__"
 local CONFIG = "minimap.cfg"
 
 local function readFile(p)
