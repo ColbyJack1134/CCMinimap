@@ -230,9 +230,10 @@ local state = {
   vy = nil,             -- vertical velocity (m/s), derived from altitude finite-diff
   lastAltSample = nil,  -- { t, alt } feeding the finite-diff
   burnerLevel = nil,    -- 0-15, from inputs.liftLevel analog read
-  phase = nil,          -- nil | CLIMB_TO_CRUISE | CRUISE | STOP_AND_RISE | LAND
+  phase = nil,          -- nil | CLIMB_TO_CRUISE | CRUISE | LAND
   altHoldActive = false,
   altHoldTarget = nil,
+  burnerTarget = nil,   -- manual setpoint from CLI; controller ramps to it, then clears
   landRampStart = nil,      -- os.clock() when LAND phase began
   landRampStartLevel = nil, -- burner level snapshot at LAND entry
   groundY = nil,        -- max surface Y in sampled chunk window (from BlueMap)
@@ -990,7 +991,7 @@ local function updatePhase()
 end
 
 local function altitudeController()
-  if not state.engaged and not state.altHoldActive then
+  if not state.engaged and not state.altHoldActive and not state.burnerTarget then
     -- Idle: hand the burner back to the manual +/- controller on the same
     -- signals. Drop any in-flight pulse and force the outputs LOW so we
     -- never fight a person holding the button.
@@ -1000,6 +1001,25 @@ local function altitudeController()
     if state.controls.liftDown then setControl("liftDown", false) end
     return
   end
+
+  -- Manual burner setpoint (from `burner N` CLI). Ramps burnerLevel toward
+  -- burnerTarget, clears the target when reached, and bails before the
+  -- altitude PID below. Disengaging via "stop" or any altHold/AUTO command
+  -- clears burnerTarget.
+  if state.burnerTarget then
+    if not state.burnerLevel then return end
+    if state.burnerLevel == state.burnerTarget then
+      state.burnerTarget = nil
+      return
+    end
+    if state.burnerLevel < state.burnerTarget then
+      pulseChannel("liftUp")
+    else
+      pulseChannel("liftDown")
+    end
+    return
+  end
+
   if not state.altitude or not state.burnerLevel then return end
 
   local desired
@@ -1306,6 +1326,77 @@ local function applyCommand(cmd)
     }
     state.engaged = false
     state.autoStatus = ""
+
+  -- ---- CLI commands ---------------------------------------------------------
+  -- Each handler is the receiving end of a `ship <cmd>` invocation; see
+  -- computercraft/ship.lua for the sending side.
+
+  elseif id == "goto" and type(cmd.x) == "number" and type(cmd.z) == "number" then
+    state.target = { kind = "cli", name = "GOTO", x = cmd.x, z = cmd.z, color = "1" }
+    state.engaged = true
+    state.phase = nil
+    state.altHoldActive = false
+    state.altHoldTarget = nil
+    state.burnerTarget = nil
+    state.autoStatus = ""
+
+  elseif id == "goto_wp" and type(cmd.name) == "string" then
+    local target = cmd.name:lower()
+    for _, wp in ipairs(state.waypoints or {}) do
+      if type(wp.name) == "string" and wp.name:lower() == target then
+        state.target = {
+          kind = "waypoint", name = wp.name, x = wp.x, z = wp.z,
+          color = paletteHexFor(wp.color),
+        }
+        state.engaged = true
+        state.phase = nil
+        state.altHoldActive = false
+        state.altHoldTarget = nil
+        state.burnerTarget = nil
+        state.autoStatus = ""
+        break
+      end
+    end
+
+  elseif id == "set_burner" and type(cmd.level) == "number" then
+    local lvl = math.floor(cmd.level)
+    if lvl >= 0 and lvl <= 15 then
+      -- Manual burner override; abandon any autopilot / hold currently driving it.
+      state.engaged = false
+      state.phase = nil
+      state.altHoldActive = false
+      state.altHoldTarget = nil
+      state.burnerTarget = lvl
+      state.autoStatus = ""
+      setControl("forward", false); setControl("left", false); setControl("right", false)
+    end
+
+  elseif id == "stop" then
+    state.target = nil
+    state.engaged = false
+    state.phase = nil
+    state.altHoldActive = false
+    state.altHoldTarget = nil
+    state.burnerTarget = nil
+    state.autoStatus = ""
+    setControl("forward", false); setControl("left", false); setControl("right", false)
+
+  elseif id == "hold" then
+    if type(cmd.altitude) == "number" then
+      state.altHoldActive = true
+      state.altHoldTarget = cmd.altitude
+      state.burnerTarget = nil
+      state.engaged = false
+      state.phase = nil
+      setControl("forward", false); setControl("left", false); setControl("right", false)
+    elseif state.altHoldActive then
+      state.altHoldActive = false
+      state.altHoldTarget = nil
+    else
+      state.altHoldActive = true
+      state.altHoldTarget = state.altitude
+      state.burnerTarget = nil
+    end
   end
 end
 
@@ -1340,6 +1431,29 @@ local function handleTouch(_, side, x, y)
   end
 end
 
+-- Snapshot of the ship state that gets broadcast over rednet and returned in
+-- response to a local "ship_state_request" event from ship.lua.
+local function stateSnapshot()
+  return {
+    lastPos       = state.lastPos,
+    shipHeading   = state.shipHeading,
+    altitude      = state.altitude,
+    burnerLevel   = state.burnerLevel,
+    velocity      = state.velocity,
+    vy            = state.vy,
+    groundY       = state.groundY,
+    target        = state.target,
+    engaged       = state.engaged,
+    altHoldActive = state.altHoldActive,
+    altHoldTarget = state.altHoldTarget,
+    burnerTarget  = state.burnerTarget,
+    phase         = state.phase,
+    autoStatus    = state.autoStatus,
+    bpp           = state.bpp,
+    lod           = state.lod,
+  }
+end
+
 local function eventLoop()
   while state.running do
     local event = { os.pullEvent() }
@@ -1349,6 +1463,12 @@ local function eventLoop()
       width, height = monitor.getSize()
     elseif event[1] == "key" and event[2] == keys.q then
       state.running = false
+    elseif event[1] == "ship_cmd" and type(event[2]) == "table" then
+      -- Local CLI on the same computer. On the ship we apply directly; on
+      -- the pocket we hop through dispatchCommand so it forwards over rednet.
+      if IS_POCKET then dispatchCommand(event[2]) else applyCommand(event[2]) end
+    elseif event[1] == "ship_state_request" then
+      os.queueEvent("ship_state_response", stateSnapshot())
     end
   end
 end
@@ -1379,6 +1499,7 @@ local function rednetLoop()
           state.engaged       = msg.engaged
           state.altHoldActive = msg.altHoldActive
           state.altHoldTarget = msg.altHoldTarget
+          state.burnerTarget  = msg.burnerTarget
           state.phase         = msg.phase
           state.autoStatus    = msg.autoStatus or ""
           if msg.bpp then state.bpp = msg.bpp end
@@ -1395,23 +1516,7 @@ local function rednetLoop()
         applyCommand(msg)
       end
       if os.clock() >= nextBroadcast then
-        pcall(rednet.broadcast, {
-          lastPos       = state.lastPos,
-          shipHeading   = state.shipHeading,
-          altitude      = state.altitude,
-          burnerLevel   = state.burnerLevel,
-          velocity      = state.velocity,
-          vy            = state.vy,
-          groundY       = state.groundY,
-          target        = state.target,
-          engaged       = state.engaged,
-          altHoldActive = state.altHoldActive,
-          altHoldTarget = state.altHoldTarget,
-          phase         = state.phase,
-          autoStatus    = state.autoStatus,
-          bpp           = state.bpp,
-          lod           = state.lod,
-        }, STATE_PROTOCOL)
+        pcall(rednet.broadcast, stateSnapshot(), STATE_PROTOCOL)
         nextBroadcast = os.clock() + STATE_BROADCAST_INTERVAL
       end
     end

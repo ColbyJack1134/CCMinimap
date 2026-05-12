@@ -56,6 +56,16 @@ end
 -- 2. Pull the pocket client (same minimap.lua content under a different name).
 syncFile("minimap-pocket.lua", "minimap-pocket.lua")
 
+-- 2a. CLI dispatcher + shims. Same set as on the ship -- ship.lua dispatches
+-- via rednet from the pocket.
+syncFile("ship.lua", "ship.lua")
+local SHIM_NAMES = {"goto", "burner", "stop", "hold", "status", "wp"}
+for _, name in ipairs(SHIM_NAMES) do
+  local path = name .. ".lua"
+  local body = string.format('shell.run("ship", %q, ...)\n', name)
+  if readFile(path) ~= body then writeFile(path, body) end
+end
+
 -- 3. Merge any new default config keys into minimap-pocket.cfg without overwriting.
 -- Only pocket-relevant keys; the ship owns controller/peripheral tunables.
 local defaults = fetchJson(SERVER .. "/config.defaults.pocket")
