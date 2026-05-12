@@ -59,14 +59,6 @@ syncFile("minimap.lua")
 -- forwards to ship.lua when called with args.
 syncFile("ship.lua")
 
--- Older boots installed bare shims (goto.lua, burner.lua, ...) alongside
--- ship.lua. They've been retired; delete them on boot so a manual rm sticks.
-local STALE_SHIMS = {"goto", "burner", "stop", "hold", "status", "wp"}
-for _, name in ipairs(STALE_SHIMS) do
-  local path = name .. ".lua"
-  if fs.exists(path) then fs.delete(path) end
-end
-
 -- 3. Merge new default config keys without overwriting existing ones.
 local defaults = fetchJson(SERVER .. "/config.defaults")
 if type(defaults) == "table" then
