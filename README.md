@@ -34,7 +34,7 @@ Tap a waypoint dot or another player to set them as the target.
 
 - [BlueMap](https://bluemap.bluecolored.de/)
 - [Create Aeronautics](https://github.com/Sciecode/create-aeronautics)
-- [CC:Tweaked](https://tweaked.cc/), with the proxy host in `http.allowed_websites`
+- [CC:Tweaked](https://tweaked.cc/)
 - Docker
 
 ## Server setup
