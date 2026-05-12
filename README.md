@@ -67,21 +67,6 @@ the Lua client over HTTP.
    the container). Format mirrors `waypoints.example.json`. Reload by
    restarting the container.
 
-### Server endpoints
-
-| Path | Returns |
-|---|---|
-| `/health` | liveness |
-| `/info` | configured map id, lowres metadata, CC palette |
-| `/frame?x&z&w&h&bpp&lod` | a minimap frame: `{w,h,x,z,text,fg,bg}` packed for `monitor.blit` |
-| `/debug.png?x&z&w&h&bpp&lod&scale` | the same frame as a PNG (1-8x upscale) for browser inspection |
-| `/players` | BlueMap live-player positions (1s cache) |
-| `/waypoints` | merged `waypoints.json` + BlueMap markers |
-| `/height?x&z&r` | min/max surface Y in a (2r+1)² chunk window, read from BlueMap's lowres heightmap |
-| `/minimap.lua`, `/startup.lua` | ship client, with `__SERVER_URL__` / `__PLAYER_NAME__` substituted from env |
-| `/minimap-pocket.lua`, `/startup-pocket.lua` | pocket client |
-| `/config.defaults`, `/config.defaults.pocket` | default cfg blocks the startup scripts merge |
-
 ## In-game wiring
 
 ### Ship CC computer
@@ -158,26 +143,3 @@ If two players share one BlueMap proxy:
 - Set `CLIENT_PLAYER_NAME` blank in the server `.env`.
 - Each CC sets its own `playerName` in `minimap.cfg`.
 - Each player picks their own `airshipName` + `controlSecret`.
-
-## Tuning notes
-
-- **Hover trim**: with the ship hovering steady, the burner level
-  that holds altitude is your `hoverBurnerLevel`. The PD controller
-  starts here and adds/subtracts based on error & vertical velocity.
-- **Oscillating altitude hold**: roughly half `liftKp` and double
-  `liftKd`. With pulse-driven actuation the controller is fairly
-  forgiving; start with `Kp=0.15`, `Kd=2.5` if 0.4/1.2 hunts.
-- **Pulse duration**: `liftPulseSeconds` (default 0.2 s HIGH then
-  matching LOW cooldown). Increase if your burner receiver wants a
-  longer edge.
-- **STOP_AND_RISE**: removed by design. If the autopilot drives into
-  terrain, raise `cruiseAltitudeAboveGround`.
-
-## Roadmap
-
-See [TODO.md](TODO.md) for tracked future work (forward-looking
-terrain sampling, predicted-altitude ghost cursor on the tape, ...).
-
-## License
-
-MIT. See [LICENSE](LICENSE).
