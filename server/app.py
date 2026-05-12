@@ -240,6 +240,10 @@ def create_app() -> Flask:
     def startup_pocket_lua():
         return serve_lua("/app/computercraft/startup-pocket.lua")
 
+    @app.get("/ship.lua")
+    def ship_lua():
+        return serve_lua("/app/computercraft/ship.lua")
+
     return app
 
 

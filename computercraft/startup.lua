@@ -55,6 +55,17 @@ end
 -- 2. Update minimap.lua in place (not yet loaded, so no reboot needed).
 syncFile("minimap.lua")
 
+-- 2a. CLI dispatcher + one-line shims. Shims are regenerated from this list
+-- every boot, so adding a new command is: (a) handler in ship.lua, (b)
+-- handler in minimap.lua applyCommand, (c) add the name below.
+syncFile("ship.lua")
+local SHIM_NAMES = {"goto", "burner", "stop", "hold", "status", "wp"}
+for _, name in ipairs(SHIM_NAMES) do
+  local path = name .. ".lua"
+  local body = string.format('shell.run("ship", %q, ...)\n', name)
+  if readFile(path) ~= body then writeFile(path, body) end
+end
+
 -- 3. Merge new default config keys without overwriting existing ones.
 local defaults = fetchJson(SERVER .. "/config.defaults")
 if type(defaults) == "table" then
