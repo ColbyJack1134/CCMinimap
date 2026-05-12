@@ -1478,6 +1478,14 @@ local function eventLoop()
       if IS_POCKET then dispatchCommand(event[2]) else applyCommand(event[2]) end
     elseif event[1] == "ship_state_request" then
       os.queueEvent("ship_state_response", stateSnapshot())
+    elseif event[1] == "ship_waypoints_request" then
+      -- Used by the shell autocompleter for `minimap wp <name>`. Just names,
+      -- no coords, since the completer only ranks/filters strings.
+      local names = {}
+      for _, wp in ipairs(state.waypoints or {}) do
+        if type(wp.name) == "string" then names[#names + 1] = wp.name end
+      end
+      os.queueEvent("ship_waypoints_response", names)
     end
   end
 end

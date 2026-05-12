@@ -116,4 +116,43 @@ if type(defaults) == "table" then
   end
 end
 
+-- 4. Shell autocomplete for `minimap <subcommand> [args]`. Registered before
+-- minimap launches so the prompt has completions available immediately.
+local SUBCOMMANDS = {"goto", "burner", "stop", "hold", "status", "wp", "help", "--help"}
+
+local function suffixesFromPrefix(list, prefix)
+  local out = {}
+  for _, item in ipairs(list) do
+    if item:sub(1, #prefix) == prefix and #item > #prefix then
+      out[#out + 1] = item:sub(#prefix + 1)
+    end
+  end
+  return out
+end
+
+local function fetchWaypointNames()
+  os.queueEvent("ship_waypoints_request")
+  local deadline = os.startTimer(0.3)
+  while true do
+    local e, p1 = os.pullEvent()
+    if e == "ship_waypoints_response" and type(p1) == "table" then return p1 end
+    if e == "timer" and p1 == deadline then return {} end
+  end
+end
+
+local function minimapCompleter(_, index, argument, previous)
+  if index == 1 then
+    return suffixesFromPrefix(SUBCOMMANDS, argument)
+  end
+  if index == 2 and previous[1] == "wp" then
+    return suffixesFromPrefix(fetchWaypointNames(), argument)
+  end
+  return {}
+end
+
+local minimapPath = shell.resolveProgram("minimap")
+if minimapPath then
+  shell.setCompletionFunction(minimapPath, minimapCompleter)
+end
+
 shell.run("bg", "minimap")
