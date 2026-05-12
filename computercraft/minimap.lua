@@ -19,12 +19,31 @@ if not fs.exists(CONFIG_FILE) then
   f.write([[{
   "headingOffset": 0,
   "needleLength": 5,
-  "controlSides": { "forward": "back", "back": "top", "left": "left", "right": "right" },
+  "channels": {
+    "forward":  { "relay": "redstone_relay_0", "side": "back" },
+    "back":     { "relay": "redstone_relay_0", "side": "top" },
+    "left":     { "relay": "redstone_relay_0", "side": "left" },
+    "right":    { "relay": "redstone_relay_0", "side": "right" },
+    "liftUp":   { "relay": "redstone_relay_1", "side": "right" },
+    "liftDown": { "relay": "redstone_relay_1", "side": "left" }
+  },
+  "inputs": {
+    "liftLevel": { "relay": "redstone_relay_1", "side": "front" }
+  },
   "showAltitudeTape": true,
   "showSpeedDial": true,
   "maxAltitude": 320,
   "maxSpeed": 5,
-  "velocityFlipped": true
+  "velocityFlipped": true,
+  "groundSampleChunkRadius": 1,
+  "cruiseAltitudeAboveGround": 50,
+  "minAltitudeAboveGround": 20,
+  "hoverBurnerLevel": 7,
+  "landBurnerLevel": 3,
+  "liftKp": 0.4,
+  "liftKd": 1.2,
+  "liftPulseSeconds": 0.2,
+  "landRampSeconds": 2.0
 }
 ]])
   f.close()
@@ -40,18 +59,47 @@ end
 
 local NEEDLE_LENGTH_SUB = tonumber(cfg.needleLength) or 5
 
-local function cfgSide(name, default)
-  local cs = cfg.controlSides
-  if type(cs) == "table" and type(cs[name]) == "string" then return cs[name] end
-  return default
+local function cfgChannel(name, defaults)
+  local cs = cfg.channels
+  if type(cs) == "table" and type(cs[name]) == "table" then
+    local entry = cs[name]
+    if type(entry.relay) == "string" and type(entry.side) == "string" then
+      return { relay = entry.relay, side = entry.side }
+    end
+  end
+  return defaults
 end
-local CONTROL_SIDES = {
-  forward = cfgSide("forward", "back"),
-  back    = cfgSide("back",    "top"),
-  left    = cfgSide("left",    "left"),
-  right   = cfgSide("right",   "right"),
+local function cfgInput(name)
+  local cs = cfg.inputs
+  if type(cs) == "table" and type(cs[name]) == "table" then
+    local entry = cs[name]
+    if type(entry.relay) == "string" and type(entry.side) == "string" then
+      return { relay = entry.relay, side = entry.side }
+    end
+  end
+  return nil
+end
+local CHANNELS = {
+  forward  = cfgChannel("forward",  { relay = "redstone_relay_0", side = "back"  }),
+  back     = cfgChannel("back",     { relay = "redstone_relay_0", side = "top"   }),
+  left     = cfgChannel("left",     { relay = "redstone_relay_0", side = "left"  }),
+  right    = cfgChannel("right",    { relay = "redstone_relay_0", side = "right" }),
+  liftUp   = cfgChannel("liftUp",   { relay = "redstone_relay_1", side = "right" }),
+  liftDown = cfgChannel("liftDown", { relay = "redstone_relay_1", side = "left"  }),
 }
-local relay = peripheral.find("redstone_relay")
+local INPUTS = {
+  liftLevel = cfgInput("liftLevel"),
+}
+
+local relayCache = {}
+local function wrapRelay(name)
+  if not name then return nil end
+  if relayCache[name] then return relayCache[name] end
+  local ok, r = pcall(peripheral.wrap, name)
+  if ok and r then relayCache[name] = r end
+  return relayCache[name]
+end
+
 local altSensor = peripheral.find("altitude_sensor")
 local velSensor = peripheral.find("velocity_sensor")
 
@@ -59,7 +107,20 @@ local SHOW_ALT_TAPE   = (cfg.showAltitudeTape ~= false)
 local SHOW_SPEED_DIAL = (cfg.showSpeedDial ~= false)
 local MAX_ALT   = tonumber(cfg.maxAltitude) or 320
 local MAX_SPEED = tonumber(cfg.maxSpeed) or 5
+local GROUND_CHUNK_RADIUS = math.floor(tonumber(cfg.groundSampleChunkRadius) or 1)
 local VELOCITY_FLIPPED = (cfg.velocityFlipped ~= false)
+local CRUISE_ALT_AGL    = tonumber(cfg.cruiseAltitudeAboveGround) or 50
+local MIN_ALT_AGL       = tonumber(cfg.minAltitudeAboveGround) or 20
+local HOVER_BURNER      = tonumber(cfg.hoverBurnerLevel) or 7
+local LAND_BURNER       = tonumber(cfg.landBurnerLevel) or 3
+local LIFT_KP           = tonumber(cfg.liftKp) or 0.4
+local LIFT_KD           = tonumber(cfg.liftKd) or 1.2
+local LIFT_PULSE_S      = tonumber(cfg.liftPulseSeconds) or 0.2
+local LAND_RAMP_S       = tonumber(cfg.landRampSeconds) or 2.0
+local CLIMB_DONE_MARGIN = 5    -- blocks below cruise that count as "arrived at cruise"
+local RECOVER_MARGIN    = 10   -- exit STOP_AND_RISE this many blocks above MIN_ALT_AGL
+local LANDED_ALT_MARGIN = 2    -- |alt - groundY| < this and |vy| small = landed
+local LANDED_VY_THRESH  = 0.1
 local NEEDLE_AREA_W = 2 * math.ceil(NEEDLE_LENGTH_SUB / SUB_W) + 1
 local NEEDLE_AREA_H = 2 * math.ceil(NEEDLE_LENGTH_SUB / SUB_H) + 1
 
@@ -90,7 +151,23 @@ local state = {
   controls = {},        -- intended redstone state per channel; pending hardware
   targetCells = {},     -- list of clickable target hitboxes built each frame
   altitude = nil, pressure = nil, velocity = nil,
+  vy = nil,             -- vertical velocity (m/s), derived from altitude finite-diff
+  lastAltSample = nil,  -- { t, alt } feeding the finite-diff
+  burnerLevel = nil,    -- 0-15, from inputs.liftLevel analog read
+  phase = nil,          -- nil | CLIMB_TO_CRUISE | CRUISE | STOP_AND_RISE | LAND
+  altHoldActive = false,
+  altHoldTarget = nil,
+  landRampStart = nil,      -- os.clock() when LAND phase began
+  landRampStartLevel = nil, -- burner level snapshot at LAND entry
+  descending = false,       -- ALT toggled off -> ramp to landBurnerLevel
+  descendStart = nil,
+  descendStartLevel = nil,
+  groundY = nil,        -- max surface Y in sampled chunk window (from BlueMap)
+  groundYMin = nil,     -- min surface Y in same window
   lastTapeCells = {},   -- cell keys we lit last tape draw, restored next frame
+  lastTapeAlt = nil,    -- altitude value last drawn on tape (for skip-if-unchanged)
+  lastTapeGround = nil, -- ground value last drawn on tape
+  lastBurnerLevel = nil,-- burner level last drawn on tape marker
   lastDialCells = {},   -- same idea for the speedometer needle
   status = "starting",
   running = true,
@@ -436,23 +513,63 @@ local function readVelocity()
   end
 end
 
--- Altitude tape on the right edge. Wide thermometer-style bar with a dark
--- panel background and a colored fill that grows from the bottom up to the
--- current altitude. Top of the fill is the indicator.
+-- Altitude tape on the right edge. Zoned thermometer: white above ship, gray
+-- between ship and ground, red below ground; black cursors at ship altitude
+-- and ground level, numeric labels for each.
 local TAPE_WIDTH = 3
-local TAPE_PAD_RIGHT = 1   -- empty cells between tape and right screen edge
-local TAPE_PAD_VERT  = 1   -- empty rows above and below the tape
-local TAPE_BG   = "f"      -- void (near black, contrasts with ocean)
-local TAPE_FILL = "e"      -- brick (orange-red fill)
-local TAPE_TIP  = "0"      -- snow (white top edge)
+local TAPE_PAD_RIGHT = 1
+local TAPE_PAD_VERT  = 1
+local TAPE_ABOVE  = "7"   -- dark gray (above ship altitude)
+local TAPE_MID    = "8"   -- light gray (between ship and ground)
+local TAPE_BELOW  = "e"   -- red/brick (below ground)
+local TAPE_CURSOR = "f"   -- black (ship + ground tick)
+local TAPE_LABEL_FG = "f" -- black numeric label text
+
+-- Burner marker: 3 cells of yellow bg at the ship cursor row of the alt tape,
+-- with the burner level (0-15) rendered as a centered 2-digit decimal.
+local BURNER_MARKER_BG  = "4"  -- yellow
+local BURNER_MARKER_FG  = "f"  -- black digits
+
+local function blitTapeCell(col, row, pattern, fg, bg)
+  monitor.setCursorPos(col, row)
+  local emit = pattern
+  local f, b = fg, bg
+  if bit32.band(emit, 0x20) ~= 0 then
+    emit = bit32.bxor(emit, 0x3F)
+    f, b = b, f
+  end
+  monitor.blit(string.char(emit + 0x80), f, b)
+end
+
+local function drawTapeLabel(text, row, anchorCol, bg, fg)
+  local startCol = anchorCol - #text + 1
+  for i = 1, #text do
+    local c = startCol + i - 1
+    if c >= 1 and c <= width then
+      monitor.setCursorPos(c, row)
+      monitor.blit(text:sub(i, i), fg, bg)
+      state.lastTapeCells[c * 1024 + row] = true
+    end
+  end
+end
 
 local function overlayAltitudeTape(mapH)
+  -- Skip-if-unchanged: tape depends on altitude, groundY, and the burner marker.
+  if SHOW_ALT_TAPE and state.altitude
+      and state.altitude == state.lastTapeAlt
+      and state.groundY == state.lastTapeGround
+      and state.burnerLevel == state.lastBurnerLevel then
+    return
+  end
   for key in pairs(state.lastTapeCells) do
     local c = math.floor(key / 1024)
     local r = key - c * 1024
     overlayCell(c, r, 0, "0", mapH, true)
   end
   state.lastTapeCells = {}
+  state.lastTapeAlt = nil
+  state.lastTapeGround = nil
+  state.lastBurnerLevel = nil
   if not SHOW_ALT_TAPE or not state.altitude then return end
   local topRow = 1 + TAPE_PAD_VERT
   local botRow = mapH - TAPE_PAD_VERT
@@ -460,36 +577,91 @@ local function overlayAltitudeTape(mapH)
   local height_rows = botRow - topRow + 1
   local cols = {}
   for i = 1, TAPE_WIDTH do cols[i] = width - TAPE_PAD_RIGHT - TAPE_WIDTH + i end
-  local altRatio = math.max(0, math.min(1, state.altitude / MAX_ALT))
   local maxSubY = height_rows * SUB_H - 1
+
+  local altRatio = math.max(0, math.min(1, state.altitude / MAX_ALT))
   local altSubY = math.floor((1 - altRatio) * maxSubY + 0.5)
+  local groundSubY = nil
+  if state.groundY then
+    local gr = math.max(0, math.min(1, state.groundY / MAX_ALT))
+    groundSubY = math.floor((1 - gr) * maxSubY + 0.5)
+  end
+
+  -- Classify each sub-pixel into a color, then pick best 2-color blit per cell.
+  local function subColor(globalSubY)
+    if globalSubY == altSubY then return TAPE_CURSOR end
+    if groundSubY and globalSubY == groundSubY then return TAPE_CURSOR end
+    if globalSubY < altSubY then return TAPE_ABOVE end
+    if groundSubY and globalSubY > groundSubY then return TAPE_BELOW end
+    return TAPE_MID
+  end
+
+  -- When a burner reading is available, the cell-row containing the ship
+  -- cursor is replaced with a yellow marker spelling out the burner level
+  -- (so the ship cursor doubles as the burner indicator).
+  local altRow = 1 + TAPE_PAD_VERT + math.floor(altSubY / SUB_H)
+  local markerText
+  if state.burnerLevel then
+    markerText = string.format(" %2d", state.burnerLevel):sub(1, TAPE_WIDTH)
+  end
+
   for r = topRow, botRow do
-    local relRow = r - topRow
-    local rowTopSubY = relRow * SUB_H
-    local pattern = 0
-    for sy = 0, SUB_H - 1 do
-      local globalY = rowTopSubY + sy
-      if globalY >= altSubY then
+    if markerText and r == altRow then
+      for i, c in ipairs(cols) do
+        local ch = markerText:sub(i, i)
+        if ch == "" then ch = " " end
+        monitor.setCursorPos(c, r)
+        monitor.blit(ch, BURNER_MARKER_FG, BURNER_MARKER_BG)
+        state.lastTapeCells[c * 1024 + r] = true
+      end
+    else
+      local rowTopSubY = (r - topRow) * SUB_H
+      local subs = {}
+      local counts = {}
+      for sy = 0, SUB_H - 1 do
         for sx = 0, SUB_W - 1 do
-          pattern = bit32.bor(pattern, bit32.lshift(1, sy * SUB_W + sx))
+          local color = subColor(rowTopSubY + sy)
+          subs[sy * SUB_W + sx] = color
+          counts[color] = (counts[color] or 0) + 1
         end
       end
-    end
-    local indSy = altSubY - rowTopSubY
-    local fg = TAPE_FILL
-    if indSy >= 0 and indSy < SUB_H then fg = TAPE_TIP end
-    for _, c in ipairs(cols) do
-      monitor.setCursorPos(c, r)
-      local emit = pattern
-      local f, b = fg, TAPE_BG
-      if bit32.band(emit, 0x20) ~= 0 then
-        emit = bit32.bxor(emit, 0x3F)
-        f, b = b, f
+      -- Pick top-two colors by count; cursor color always wins over its zone.
+      local ranked = {}
+      for color in pairs(counts) do ranked[#ranked + 1] = color end
+      table.sort(ranked, function(a, b) return counts[a] > counts[b] end)
+      local bg = ranked[1]
+      local fg = ranked[2] or bg
+      if bg == TAPE_CURSOR and fg ~= TAPE_CURSOR then bg, fg = fg, bg end
+      local pattern = 0
+      for i = 0, SUB_W * SUB_H - 1 do
+        if subs[i] == fg and fg ~= bg then
+          pattern = bit32.bor(pattern, bit32.lshift(1, i))
+        end
       end
-      monitor.blit(string.char(emit + 0x80), f, b)
-      state.lastTapeCells[c * 1024 + r] = true
+      for _, c in ipairs(cols) do
+        blitTapeCell(c, r, pattern, fg, bg)
+        state.lastTapeCells[c * 1024 + r] = true
+      end
     end
   end
+
+  -- Numeric labels: altitude near the ship row, ground near the ground row.
+  -- Label bg = the cell's "above-cursor" zone color so it blends naturally.
+  local labelAnchor = cols[1] - 2 -- one-col gap before tape
+  local function labelRow(subY)
+    return topRow + math.floor(subY / SUB_H)
+  end
+  drawTapeLabel(tostring(math.floor(state.altitude + 0.5)), altRow, labelAnchor, TAPE_MID, TAPE_LABEL_FG)
+  if groundSubY and state.groundY then
+    local groundRow = labelRow(groundSubY)
+    if groundRow ~= altRow then
+      drawTapeLabel(tostring(state.groundY), groundRow, labelAnchor, TAPE_MID, TAPE_LABEL_FG)
+    end
+  end
+
+  state.lastTapeAlt = state.altitude
+  state.lastTapeGround = state.groundY
+  state.lastBurnerLevel = state.burnerLevel
 end
 
 -- Big speedometer in the bottom-left of the map area. Half-circle dial with
@@ -584,28 +756,194 @@ local function overlaySpeedDial(mapH)
   end
 end
 
--- Channels: "forward", "left", "right", "back". Side mapping from minimap.cfg.
 local function setControl(name, on)
   on = on and true or false
   state.controls[name] = on
-  local side = CONTROL_SIDES[name]
-  if relay and side then pcall(relay.setOutput, side, on) end
+  local ch = CHANNELS[name]
+  if not ch then return end
+  local r = wrapRelay(ch.relay)
+  if not r or type(r.setOutput) ~= "function" then return end
+  pcall(r.setOutput, ch.side, on)
 end
 
-local function autopilotTick()
-  if not state.engaged or not state.target or not state.lastPos then
-    setControl("forward", false); setControl("left", false); setControl("right", false)
+-- Pulse-driven channels (liftUp/liftDown): rising edge triggers burner +/-1.
+-- Cycle is LIFT_PULSE_S HIGH then LIFT_PULSE_S LOW before another pulse can fire.
+local pulseState = {}  -- name -> { stage = "on" | "off", endsAt = clock }
+
+local function tickPulses()
+  local now = os.clock()
+  local done = {}
+  for name, p in pairs(pulseState) do
+    if now >= p.endsAt then
+      if p.stage == "on" then
+        setControl(name, false)
+        p.stage = "off"
+        p.endsAt = now + LIFT_PULSE_S
+      else
+        done[#done + 1] = name
+      end
+    end
+  end
+  for _, n in ipairs(done) do pulseState[n] = nil end
+end
+
+local function pulseChannel(name)
+  if pulseState[name] then return false end
+  if not CHANNELS[name] then return false end
+  setControl(name, true)
+  pulseState[name] = { stage = "on", endsAt = os.clock() + LIFT_PULSE_S }
+  return true
+end
+
+local function updateBurnerLevel()
+  local inp = INPUTS.liftLevel
+  if not inp then return end
+  local r = wrapRelay(inp.relay)
+  if not r or type(r.getAnalogInput) ~= "function" then return end
+  local ok, v = pcall(r.getAnalogInput, inp.side)
+  if ok and type(v) == "number" then state.burnerLevel = v end
+end
+
+local function updateVy()
+  if not state.altitude then return end
+  local now = os.clock()
+  if state.lastAltSample then
+    local dt = now - state.lastAltSample.t
+    if dt > 0 then
+      local raw = (state.altitude - state.lastAltSample.alt) / dt
+      state.vy = (state.vy or 0) * 0.7 + raw * 0.3
+    end
+  end
+  state.lastAltSample = { t = now, alt = state.altitude }
+end
+
+local function updatePhase()
+  if not state.engaged then state.phase = nil; return end
+  if not state.target or not state.lastPos then
+    state.engaged = false
+    state.phase = nil
     return
   end
   local dx = (state.target.x or 0) - state.lastPos.x
   local dz = (state.target.z or 0) - state.lastPos.z
   local range = math.sqrt(dx * dx + dz * dz)
-  if range < ARRIVAL_RADIUS then
-    setControl("forward", false); setControl("left", false); setControl("right", false)
-    state.engaged = false
-    state.autoStatus = "ARRIVED"
+  local agl
+  if state.altitude and state.groundY then agl = state.altitude - state.groundY end
+
+  if state.phase == "LAND" then
+    if agl and agl < LANDED_ALT_MARGIN and math.abs(state.vy or 0) < LANDED_VY_THRESH then
+      state.engaged = false
+      state.phase = nil
+      state.autoStatus = "LANDED"
+    end
     return
   end
+
+  if range < ARRIVAL_RADIUS then
+    if state.altHoldActive then
+      -- ALT was engaged in parallel; hand altitude off to it instead of landing.
+      state.engaged = false
+      state.phase = nil
+      setControl("forward", false); setControl("left", false); setControl("right", false)
+      state.autoStatus = "ARRIVED"
+    else
+      state.phase = "LAND"
+      state.landRampStart = os.clock()
+      state.landRampStartLevel = state.burnerLevel or HOVER_BURNER
+    end
+    return
+  end
+
+  if state.phase == "STOP_AND_RISE" then
+    if agl and agl >= MIN_ALT_AGL + RECOVER_MARGIN then state.phase = "CRUISE" end
+    return
+  end
+  if agl and agl < MIN_ALT_AGL then state.phase = "STOP_AND_RISE"; return end
+
+  if state.phase == "CLIMB_TO_CRUISE" then
+    if agl and agl >= CRUISE_ALT_AGL - CLIMB_DONE_MARGIN then state.phase = "CRUISE" end
+    return
+  end
+
+  if state.phase == nil then
+    if agl and agl < CRUISE_ALT_AGL - CLIMB_DONE_MARGIN then
+      state.phase = "CLIMB_TO_CRUISE"
+    else
+      state.phase = "CRUISE"
+    end
+  end
+end
+
+local function altitudeController()
+  -- Auto-exit descent once the ship has effectively landed.
+  if state.descending and state.altitude and state.groundY
+      and (state.altitude - state.groundY) < LANDED_ALT_MARGIN
+      and math.abs(state.vy or 0) < LANDED_VY_THRESH then
+    state.descending = false
+    state.descendStart = nil
+    state.descendStartLevel = nil
+  end
+
+  if not state.engaged and not state.altHoldActive and not state.descending then
+    return
+  end
+  if not state.altitude or not state.burnerLevel then return end
+
+  local desired
+  if state.engaged and state.phase == "LAND" and state.landRampStart then
+    local t = os.clock() - state.landRampStart
+    local startLvl = state.landRampStartLevel or HOVER_BURNER
+    local frac = math.min(1, t / math.max(0.001, LAND_RAMP_S))
+    desired = math.floor(startLvl + (LAND_BURNER - startLvl) * frac + 0.5)
+  elseif state.descending and state.descendStart then
+    local t = os.clock() - state.descendStart
+    local startLvl = state.descendStartLevel or HOVER_BURNER
+    local frac = math.min(1, t / math.max(0.001, LAND_RAMP_S))
+    desired = math.floor(startLvl + (LAND_BURNER - startLvl) * frac + 0.5)
+  else
+    local targetAlt
+    if state.engaged and state.groundY then
+      targetAlt = state.groundY + CRUISE_ALT_AGL
+    elseif state.altHoldActive then
+      targetAlt = state.altHoldTarget
+    end
+    if not targetAlt then return end
+    local err = targetAlt - state.altitude
+    local raw = HOVER_BURNER + LIFT_KP * err - LIFT_KD * (state.vy or 0)
+    if raw < 0 then raw = 0 elseif raw > 15 then raw = 15 end
+    desired = math.floor(raw + 0.5)
+  end
+
+  if desired > state.burnerLevel then
+    pulseChannel("liftUp")
+  elseif desired < state.burnerLevel then
+    pulseChannel("liftDown")
+  end
+end
+
+local function horizontalController()
+  if not state.engaged or not state.target or not state.lastPos then
+    setControl("forward", false); setControl("left", false); setControl("right", false)
+    return
+  end
+  if state.phase == "CLIMB_TO_CRUISE" then
+    setControl("forward", false); setControl("left", false); setControl("right", false)
+    state.autoStatus = "CLIMB"
+    return
+  end
+  if state.phase == "STOP_AND_RISE" then
+    setControl("forward", false); setControl("left", false); setControl("right", false)
+    state.autoStatus = "STOP+CLIMB"
+    return
+  end
+  if state.phase == "LAND" then
+    setControl("forward", false); setControl("left", false); setControl("right", false)
+    state.autoStatus = "LAND"
+    return
+  end
+  local dx = (state.target.x or 0) - state.lastPos.x
+  local dz = (state.target.z or 0) - state.lastPos.z
+  local range = math.sqrt(dx * dx + dz * dz)
   local desired = math.deg(math.atan2(dx, -dz)) % 360
   local err = ((desired - (state.shipHeading or 0)) + 540) % 360 - 180
   if math.abs(err) > TURN_THRESHOLD then
@@ -622,6 +960,13 @@ local function autopilotTick()
   end
 end
 
+local function autopilotTick()
+  tickPulses()
+  updatePhase()
+  horizontalController()
+  altitudeController()
+end
+
 local function drawText(x, y, text, fg, bg)
   monitor.setCursorPos(x, y)
   monitor.setTextColor(fg or colors.white)
@@ -634,31 +979,24 @@ local function drawButton(id, x, y, label)
   drawText(x, y, label, colors.black, colors.lightGray)
 end
 
-local function drawAutoBar()
-  if state.lastError then return end
-  if not state.target then return end
-  monitor.setCursorPos(1, 1)
-  monitor.setBackgroundColor(colors.black)
-  monitor.clearLine()
-  local label = state.engaged and " STOP " or " AUTO "
-  drawButton("auto", 1, 1, label)
-  drawButton("clear_target", 8, 1, " X ")
-  local dx = (state.target.x or 0) - (state.lastPos and state.lastPos.x or 0)
-  local dz = (state.target.z or 0) - (state.lastPos and state.lastPos.z or 0)
-  local range = math.floor(math.sqrt(dx * dx + dz * dz))
-  local txt = string.format("%s %dm %s", state.target.name or "?", range, state.autoStatus or "")
-  if 12 < width then drawText(12, 1, txt:sub(1, width - 11), colors.white, colors.black) end
-end
-
 local function drawOsd(x, y, z)
   local osdY = height
   monitor.setCursorPos(1, osdY)
   monitor.setBackgroundColor(colors.black)
   monitor.clearLine()
   buttons = {}
-  drawButton("zoom_in", 1, osdY, " + ")
-  drawButton("zoom_out", 5, osdY, " - ")
-  drawButton("lod", 9, osdY, "L" .. state.lod)
+  local col = 1
+  drawButton("zoom_in", col, osdY, " + "); col = col + 3
+  drawButton("zoom_out", col, osdY, " - "); col = col + 3
+  drawButton("lod", col, osdY, " L" .. state.lod); col = col + 3
+  local altLabel = state.altHoldActive and " ALT* " or " ALT "
+  drawButton("alt", col, osdY, altLabel); col = col + #altLabel
+  if state.target then
+    col = col + 1
+    local autoLabel = state.engaged and " STOP " or " AUTO "
+    drawButton("auto", col, osdY, autoLabel); col = col + #autoLabel
+    drawButton("clear_target", col, osdY, " X "); col = col + 3
+  end
   local headingStr = nav and tostring(math.floor((state.shipHeading or 0) + 0.5)) or "--"
   local pCount = #(state.players or {})
   local pInfo = "P" .. pCount
@@ -671,9 +1009,21 @@ local function drawOsd(x, y, z)
   local extras = ""
   if state.velocity then extras = extras .. string.format(" S%.1f", state.velocity) end
   if state.altitude then extras = extras .. string.format(" A%d", math.floor(state.altitude + 0.5)) end
-  local coord = string.format("X%d Z%d H%s B%s %s%s",
-    x, z, headingStr, tostring(state.bpp), pInfo, extras)
-  local startCol = math.max(13, width - #coord + 1)
+  if state.burnerLevel then extras = extras .. string.format(" Bn%d", state.burnerLevel) end
+  if state.descending then extras = extras .. " DESC" end
+  local coord
+  if state.target then
+    local dx = (state.target.x or 0) - (state.lastPos and state.lastPos.x or 0)
+    local dz = (state.target.z or 0) - (state.lastPos and state.lastPos.z or 0)
+    local range = math.floor(math.sqrt(dx * dx + dz * dz))
+    coord = string.format("%s %dm %s X%d Z%d H%s%s",
+      state.target.name or "?", range, state.autoStatus or "",
+      x, z, headingStr, extras)
+  else
+    coord = string.format("X%d Z%d H%s B%s %s%s",
+      x, z, headingStr, tostring(state.bpp), pInfo, extras)
+  end
+  local startCol = math.max(col + 1, width - #coord + 1)
   drawText(startCol, osdY, coord:sub(1, width - startCol + 1), colors.white, colors.black)
   if state.lastError then
     monitor.setCursorPos(1, 1)
@@ -698,6 +1048,15 @@ local function maybeFetchSidecar()
   if p and p.players then state.players = p.players end
   local w = httpGetJson(SERVER .. "/waypoints")
   if w then state.waypoints = w end
+  if state.lastPos then
+    local url = string.format("%s/height?x=%s&z=%s&r=%d",
+      SERVER, urlencode(state.lastPos.x), urlencode(state.lastPos.z), GROUND_CHUNK_RADIUS)
+    local h = httpGetJson(url)
+    if h and type(h.groundMaxY) == "number" then
+      state.groundY = h.groundMaxY
+      state.groundYMin = h.groundMinY
+    end
+  end
 end
 
 local function fullRedraw()
@@ -714,6 +1073,11 @@ local function fullRedraw()
   local mapH = math.max(3, height - 1)
   state.targetCells = {}
   drawCachedMap(mapH)
+  -- Map underneath changed; force tape to repaint regardless of skip guard.
+  state.lastTapeAlt = nil
+  state.lastTapeGround = nil
+  state.lastBurnerLevel = nil
+  state.lastTapeCells = {}
   overlayDotTrail(state.lastPos.x, state.lastPos.z, mapH)
   overlayWaypoints(state.lastPos.x, state.lastPos.z, mapH)
   overlayOtherPlayers(state.lastPos.x, state.lastPos.z, mapH)
@@ -721,7 +1085,6 @@ local function fullRedraw()
   overlaySpeedDial(mapH)
   overlaySelfTriangle(state.shipHeading, mapH)
   drawOsd(math.floor(state.lastPos.x), math.floor(state.lastPos.y), math.floor(state.lastPos.z))
-  drawAutoBar()
 end
 
 local function mapTick()
@@ -758,6 +1121,8 @@ local function fastTick()
   state.altitude = readAltitude()
   state.pressure = readPressure()
   state.velocity = readVelocity()
+  updateVy()
+  updateBurnerLevel()
   autopilotTick()
   if state.lastFrame and state.lastPos then
     local mapH = math.max(3, height - 1)
@@ -765,7 +1130,6 @@ local function fastTick()
     overlaySpeedDial(mapH)
     overlaySelfTriangle(state.shipHeading, mapH)
     drawOsd(math.floor(state.lastPos.x), math.floor(state.lastPos.y), math.floor(state.lastPos.z))
-    drawAutoBar()
   end
 end
 
@@ -792,11 +1156,43 @@ local function handleTouch(_, side, x, y)
         state.lod = state.lod + 1
         if state.lod > 3 then state.lod = 1 end
       elseif id == "auto" then
-        if state.target then state.engaged = not state.engaged end
+        if state.target then
+          state.engaged = not state.engaged
+          state.phase = nil
+          state.descending = false  -- AUTO press cancels any in-progress descent
+          state.descendStart = nil
+          state.descendStartLevel = nil
+          if not state.engaged then
+            setControl("forward", false); setControl("left", false); setControl("right", false)
+          end
+        end
+      elseif id == "alt" then
+        if state.altHoldActive then
+          -- Turning ALT off triggers a controlled descent to landBurnerLevel.
+          -- AUTO is canceled too -- the user is asking to come down now.
+          state.altHoldActive = false
+          state.altHoldTarget = nil
+          state.descending = true
+          state.descendStart = os.clock()
+          state.descendStartLevel = state.burnerLevel or HOVER_BURNER
+          if state.engaged then
+            state.engaged = false
+            state.phase = nil
+            setControl("forward", false); setControl("left", false); setControl("right", false)
+          end
+        else
+          state.altHoldActive = true
+          state.altHoldTarget = state.altitude
+          state.descending = false
+          state.descendStart = nil
+          state.descendStartLevel = nil
+        end
       elseif id == "clear_target" then
         state.target = nil
         state.engaged = false
+        state.phase = nil
         state.autoStatus = ""
+        setControl("forward", false); setControl("left", false); setControl("right", false)
       end
     end
   end
@@ -824,6 +1220,16 @@ local function eventLoop()
   end
 end
 
+local function resetAllOutputs()
+  for name in pairs(CHANNELS) do setControl(name, false) end
+  for k in pairs(pulseState) do pulseState[k] = nil end
+end
+
 monitor.setBackgroundColor(colors.black)
 monitor.clear()
+-- A pulse left HIGH by a previous shutdown would jam the burner. Clear every
+-- output before we start so the script always boots from a known state.
+resetAllOutputs()
 parallel.waitForAny(mapLoop, fastLoop, eventLoop)
+-- Clean exit: drop everything so a STOP after `q` doesn't leave a relay HIGH.
+resetAllOutputs()

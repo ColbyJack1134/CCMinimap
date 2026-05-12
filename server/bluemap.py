@@ -149,3 +149,63 @@ class BlueMapClient:
         local_x = (x - tile_x * world_tile_size) / lod_scale
         local_z = (z - tile_z * world_tile_size) / lod_scale
         return tile_x, tile_z, local_x, local_z, lod_scale
+
+    def sample_ground_height(self, x: float, z: float, chunk_radius: int = 1) -> dict:
+        """Sample surface Y from BlueMap LOD-1 lowres heightmap.
+
+        BlueMap lowres tiles are 501x1002 PNGs: top half (y<tileSize+1) is the
+        color image, bottom half is per-block metadata. The blue channel of
+        the bottom half = surface y-level at that block.
+
+        Returns max/min ground Y across a (2*chunk_radius+1)x(2*chunk_radius+1)
+        chunk window centered on (x, z), plus sample/miss counters.
+        """
+        if chunk_radius < 0 or chunk_radius > 8:
+            raise BlueMapError("chunk_radius must be between 0 and 8")
+        lowres = self.lowres_settings()
+        tile_size = lowres.tile_size
+        window_blocks = (2 * chunk_radius + 1) * 16
+        half = window_blocks // 2
+        cx, cz = math.floor(x), math.floor(z)
+        wx_min, wx_max = cx - half, cx - half + window_blocks - 1
+        wz_min, wz_max = cz - half, cz - half + window_blocks - 1
+        tx_min = wx_min // tile_size
+        tx_max = wx_max // tile_size
+        tz_min = wz_min // tile_size
+        tz_max = wz_max // tile_size
+
+        max_y = None
+        min_y = None
+        samples = 0
+        missing_tiles = 0
+        for tz in range(tz_min, tz_max + 1):
+            for tx in range(tx_min, tx_max + 1):
+                tile = self.fetch_lowres_tile(1, tx, tz)
+                if tile is None:
+                    missing_tiles += 1
+                    continue
+                tile_wx = tx * tile_size
+                tile_wz = tz * tile_size
+                lx0 = max(0, wx_min - tile_wx)
+                lx1 = min(tile_size, wx_max - tile_wx + 1)
+                lz0 = max(0, wz_min - tile_wz)
+                lz1 = min(tile_size, wz_max - tile_wz + 1)
+                if lx1 <= lx0 or lz1 <= lz0:
+                    continue
+                meta = tile.crop((lx0, tile_size + 1 + lz0, lx1, tile_size + 1 + lz1))
+                blue = meta.split()[2].tobytes()
+                if not blue:
+                    continue
+                samples += len(blue)
+                local_max = max(blue)
+                local_min = min(blue)
+                max_y = local_max if max_y is None else max(max_y, local_max)
+                min_y = local_min if min_y is None else min(min_y, local_min)
+        return {
+            "groundMaxY": max_y,
+            "groundMinY": min_y,
+            "chunkRadius": chunk_radius,
+            "windowBlocks": window_blocks,
+            "samples": samples,
+            "missingTiles": missing_tiles,
+        }
