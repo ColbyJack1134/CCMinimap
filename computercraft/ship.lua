@@ -166,14 +166,19 @@ commands["status"] = function()
 end
 
 commands["help"] = function()
-  print("commands:")
-  print("  goto X Z       autopilot to a coordinate")
-  print("  burner N       drive burner to level N (0-15)")
-  print("  stop           disengage everything")
-  print("  hold [alt]     toggle altitude hold (optionally at alt)")
-  print("  wp <name>      autopilot to a named waypoint")
-  print("  status         print position / heading / mode")
+  print("Ship CLI. All forms work; pick whichever is easier to type.")
+  print("")
+  print("  minimap goto X Z         autopilot to coordinate X,Z")
+  print("  minimap burner N         drive burner to level N (0-15)")
+  print("  minimap stop             disengage everything")
+  print("  minimap hold [alt]       toggle altitude hold (optional alt)")
+  print("  minimap wp <name>        autopilot to a named waypoint")
+  print("  minimap status           position / heading / mode")
+  print("")
+  print("Each subcommand also exists as a bare shim, e.g. `goto 100 200`.")
 end
+commands["--help"] = commands["help"]
+commands["-h"]     = commands["help"]
 
 local args = {...}
 local sub = table.remove(args, 1) or "help"

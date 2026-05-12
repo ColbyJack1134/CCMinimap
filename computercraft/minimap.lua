@@ -1,3 +1,12 @@
+-- CLI dispatch: `minimap <subcommand> [args]` at the shell delegates to the
+-- ship.lua dispatcher and returns. The bare `minimap` invocation (which is
+-- what startup.lua runs in the background) falls through to the display
+-- program below.
+local _cliArgs = { ... }
+if #_cliArgs > 0 then
+  return shell.run("ship", table.unpack(_cliArgs))
+end
+
 -- This file runs as both the ship-side minimap (full autopilot) and the pocket
 -- client (thin remote that mirrors state and forwards taps over rednet). The
 -- branch point is `IS_POCKET = pocket ~= nil`. The server hosts the file at

@@ -66,6 +66,14 @@ for _, name in ipairs(SHIM_NAMES) do
   if readFile(path) ~= body then writeFile(path, body) end
 end
 
+-- The long-running program here is minimap-pocket.lua, so `minimap` alone
+-- isn't a thing on the pocket. Drop a thin shim so `minimap <cmd>` and
+-- `minimap --help` work the same as on the ship.
+local minimapShim = 'shell.run("ship", ...)\n'
+if readFile("minimap.lua") ~= minimapShim then
+  writeFile("minimap.lua", minimapShim)
+end
+
 -- 3. Merge any new default config keys into minimap-pocket.cfg without overwriting.
 -- Only pocket-relevant keys; the ship owns controller/peripheral tunables.
 local defaults = fetchJson(SERVER .. "/config.defaults.pocket")
