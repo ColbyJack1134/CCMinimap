@@ -4,8 +4,11 @@
 -- /minimap.lua (ship) and /minimap-pocket.lua (pocket) -- same content.
 local IS_POCKET = pocket ~= nil
 local CONFIG_FILE = IS_POCKET and "minimap-pocket.cfg" or "minimap.cfg"
-local SERVER = "http://your-host.example.com:5055"
-local PLAYER_NAME = "YourPlayerName"
+-- __SERVER_URL__ and __PLAYER_NAME__ are substituted by the server (app.py)
+-- from the CLIENT_SERVER_URL / CLIENT_PLAYER_NAME env vars at serve time.
+-- A literal value here only matters for offline editing.
+local SERVER = "__SERVER_URL__"
+local PLAYER_NAME = "__PLAYER_NAME__"
 local NAV_PERIPHERAL = nil
 local NAV_METHOD = nil
 local FRAME_INTERVAL = 1.0
@@ -36,15 +39,36 @@ if not fs.exists(CONFIG_FILE) then
   "headingOffset": 0,
   "needleLength": 5,
   "channels": {
-    "forward":  { "relay": "redstone_relay_0", "side": "back" },
-    "back":     { "relay": "redstone_relay_0", "side": "top" },
-    "left":     { "relay": "redstone_relay_0", "side": "left" },
-    "right":    { "relay": "redstone_relay_0", "side": "right" },
-    "liftUp":   { "relay": "redstone_relay_1", "side": "right" },
-    "liftDown": { "relay": "redstone_relay_1", "side": "left" }
+    "forward": {
+      "relay": "redstone_relay_0",
+      "side": "front"
+    },
+    "back": {
+      "relay": "redstone_relay_0",
+      "side": "back"
+    },
+    "left": {
+      "relay": "redstone_relay_0",
+      "side": "left"
+    },
+    "right": {
+      "relay": "redstone_relay_0",
+      "side": "right"
+    },
+    "liftUp": {
+      "relay": "redstone_relay_1",
+      "side": "right"
+    },
+    "liftDown": {
+      "relay": "redstone_relay_1",
+      "side": "left"
+    }
   },
   "inputs": {
-    "liftLevel": { "relay": "redstone_relay_1", "side": "front" }
+    "liftLevel": {
+      "relay": "redstone_relay_1",
+      "side": "front"
+    }
   },
   "showAltitudeTape": true,
   "showSpeedDial": true,
@@ -59,7 +83,10 @@ if not fs.exists(CONFIG_FILE) then
   "liftKp": 0.4,
   "liftKd": 1.2,
   "liftPulseSeconds": 0.2,
-  "landRampSeconds": 2.0
+  "landRampSeconds": 2.0,
+  "playerName": "",
+  "airshipName": "main",
+  "controlSecret": "changeme"
 }
 ]])
   f.close()
@@ -74,6 +101,17 @@ do
 end
 
 local NEEDLE_LENGTH_SUB = tonumber(cfg.needleLength) or 5
+-- Multi-user override: cfg.playerName wins over the server-substituted default
+-- so two players sharing one BlueMap server can each suppress their own dot.
+if type(cfg.playerName) == "string" and cfg.playerName ~= "" then
+  PLAYER_NAME = cfg.playerName
+end
+-- Pairing: AIRSHIP_NAME makes the rednet hostname unique per ship, so a
+-- pocket only discovers its own ship. CONTROL_SECRET is a shared password
+-- the pocket attaches to every command and the ship verifies; without a
+-- match, the command is dropped. Must match between ship and pocket cfgs.
+local AIRSHIP_NAME      = tostring(cfg.airshipName or "main")
+local CONTROL_SECRET    = tostring(cfg.controlSecret or "changeme")
 
 local function cfgChannel(name, defaults)
   local cs = cfg.channels
@@ -119,20 +157,26 @@ end
 local altSensor = peripheral.find("altitude_sensor")
 local velSensor = peripheral.find("velocity_sensor")
 
--- Modem for ship<->pocket rednet. Auto-find on any side (or via wired modem
--- network). Ship registers itself; pockets will rednet.lookup it.
+-- Modem for ship<->pocket rednet. Must be a WIRELESS (or ender) modem -- a
+-- wired modem with `isWireless()=false` would happily open but never reach the
+-- pocket. The ship often has both kinds attached (wired for the relay
+-- network, wireless for control), so filter explicitly.
 local modemName
 do
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "modem" then
-      if not rednet.isOpen(name) then pcall(rednet.open, name) end
-      modemName = name
-      break
+      local m = peripheral.wrap(name)
+      if m and type(m.isWireless) == "function" and m.isWireless() then
+        if not rednet.isOpen(name) then pcall(rednet.open, name) end
+        modemName = name
+        break
+      end
     end
   end
 end
+local SHIP_HOSTNAME = SHIP_HOST .. "-" .. AIRSHIP_NAME
 if modemName and not IS_POCKET then
-  pcall(rednet.host, SHIP_PROTO, SHIP_HOST)
+  pcall(rednet.host, SHIP_PROTO, SHIP_HOSTNAME)
 end
 
 local SHOW_ALT_TAPE   = (cfg.showAltitudeTape ~= false)
@@ -1228,10 +1272,12 @@ local function applyCommand(cmd)
   end
 end
 
--- Pocket forwards every command to the ship over rednet. Ship applies locally.
+-- Pocket forwards every command to the ship over rednet, signed with the
+-- shared secret. Ship applies locally.
 local function dispatchCommand(cmd)
   if IS_POCKET then
     if state.shipId then
+      cmd.secret = CONTROL_SECRET
       pcall(rednet.send, state.shipId, cmd, CMD_PROTOCOL)
     end
   else
@@ -1280,7 +1326,7 @@ local function rednetLoop()
   if IS_POCKET then
     while state.running do
       if not state.shipId then
-        state.shipId = rednet.lookup(SHIP_PROTO, SHIP_HOST)
+        state.shipId = rednet.lookup(SHIP_PROTO, SHIP_HOSTNAME)
         if not state.shipId then sleep(LOOKUP_RETRY_INTERVAL) end
       else
         local id, msg = rednet.receive(STATE_PROTOCOL, 1.0)
@@ -1308,7 +1354,9 @@ local function rednetLoop()
     local nextBroadcast = 0
     while state.running do
       local id, msg = rednet.receive(CMD_PROTOCOL, 0.1)
-      if id and type(msg) == "table" then applyCommand(msg) end
+      if id and type(msg) == "table" and msg.secret == CONTROL_SECRET then
+        applyCommand(msg)
+      end
       if os.clock() >= nextBroadcast then
         pcall(rednet.broadcast, {
           lastPos       = state.lastPos,

@@ -2,7 +2,8 @@
 -- "startup.lua" on the pocket. On every boot it self-updates from the server
 -- (remote /startup-pocket.lua -> local startup.lua), then syncs minimap-pocket
 -- and runs it. Network failures are non-fatal — whatever is on disk runs.
-local SERVER = "http://your-host.example.com:5055"
+-- __SERVER_URL__ is substituted by the server (app.py) from CLIENT_SERVER_URL.
+local SERVER = "__SERVER_URL__"
 local CONFIG = "minimap-pocket.cfg"
 
 local function readFile(p)
@@ -56,7 +57,8 @@ end
 syncFile("minimap-pocket.lua", "minimap-pocket.lua")
 
 -- 3. Merge any new default config keys into minimap-pocket.cfg without overwriting.
-local defaults = fetchJson(SERVER .. "/config.defaults")
+-- Only pocket-relevant keys; the ship owns controller/peripheral tunables.
+local defaults = fetchJson(SERVER .. "/config.defaults.pocket")
 if type(defaults) == "table" then
   local raw = readFile(CONFIG)
   local current = nil
