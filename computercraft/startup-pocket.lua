@@ -60,14 +60,6 @@ syncFile("minimap-pocket.lua", "minimap-pocket.lua")
 -- shim below forwards to ship.lua.
 syncFile("ship.lua", "ship.lua")
 
--- Older boots installed bare shims (goto.lua, burner.lua, ...) alongside
--- ship.lua. They've been retired; delete them so a manual rm sticks.
-local STALE_SHIMS = {"goto", "burner", "stop", "hold", "status", "wp"}
-for _, name in ipairs(STALE_SHIMS) do
-  local path = name .. ".lua"
-  if fs.exists(path) then fs.delete(path) end
-end
-
 -- The long-running program here is minimap-pocket.lua, so `minimap` alone
 -- isn't a thing on the pocket. Drop a thin shim so `minimap <cmd>` and
 -- `minimap --help` work the same as on the ship.
