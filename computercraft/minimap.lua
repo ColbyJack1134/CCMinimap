@@ -91,6 +91,7 @@ if not fs.exists(CONFIG_FILE) then
   "landBurnerLevel": 3,
   "liftKp": 0.4,
   "liftKd": 1.2,
+  "liftKi": 0.05,
   "liftPulseSeconds": 0.2,
   "landRampSeconds": 2.0,
   "playerName": "",
@@ -200,6 +201,9 @@ local HOVER_BURNER      = tonumber(cfg.hoverBurnerLevel) or 7
 local LAND_BURNER       = tonumber(cfg.landBurnerLevel) or 3
 local LIFT_KP           = tonumber(cfg.liftKp) or 0.4
 local LIFT_KD           = tonumber(cfg.liftKd) or 1.2
+local LIFT_KI           = tonumber(cfg.liftKi) or 0.05
+local LIFT_I_MAX        = 8       -- |integrator| cap to bound anti-windup error
+local CLIMB_STUCK_S     = 3       -- seconds saturated-at-15 before surfacing CLIMB MAX
 local LIFT_PULSE_S      = tonumber(cfg.liftPulseSeconds) or 0.2
 local LAND_RAMP_S       = tonumber(cfg.landRampSeconds) or 2.0
 local CLIMB_DONE_MARGIN = 5    -- blocks below cruise that count as "arrived at cruise"
@@ -245,6 +249,9 @@ local state = {
   burnerTarget = nil,   -- manual setpoint from CLI; controller ramps to it, then clears
   landRampStart = nil,      -- os.clock() when LAND phase began
   landRampStartLevel = nil, -- burner level snapshot at LAND entry
+  liftIntegral = 0,         -- accumulated burner offset to correct altitude-dependent equilibrium
+  liftLastTick = nil,       -- os.clock() at last PID tick (for integrator dt)
+  liftSaturatedSince = nil, -- os.clock() when PID first wanted >15 with vy~0 and err>0
   groundY = nil,        -- max surface Y in sampled chunk window (from BlueMap)
   groundYMin = nil,     -- min surface Y in same window
   lastTapeCells = {},   -- cell keys we lit last tape draw, restored next frame
@@ -948,6 +955,16 @@ local function updateVy()
   state.lastAltSample = { t = now, alt = state.altitude }
 end
 
+-- Clear the altitude PI controller's integrator. Call on every mode change
+-- (engage/disengage, new target, hold toggle, manual burner, land entry) so
+-- the integrator restarts unbiased instead of carrying stale error from the
+-- previous setpoint.
+local function resetLiftIntegrator()
+  state.liftIntegral = 0
+  state.liftLastTick = nil
+  state.liftSaturatedSince = nil
+end
+
 local function updatePhase()
   if not state.engaged then state.phase = nil; return end
   if not state.target or not state.lastPos then
@@ -981,6 +998,7 @@ local function updatePhase()
       state.phase = "LAND"
       state.landRampStart = os.clock()
       state.landRampStartLevel = state.burnerLevel or HOVER_BURNER
+      resetLiftIntegrator()
     end
     return
   end
@@ -1008,6 +1026,7 @@ local function altitudeController()
     pulseState.liftDown = nil
     if state.controls.liftUp then setControl("liftUp", false) end
     if state.controls.liftDown then setControl("liftDown", false) end
+    resetLiftIntegrator()
     return
   end
 
@@ -1046,9 +1065,42 @@ local function altitudeController()
     end
     if not targetAlt then return end
     local err = targetAlt - state.altitude
-    local raw = HOVER_BURNER + LIFT_KP * err - LIFT_KD * (state.vy or 0)
+
+    -- PI + D-on-velocity. The integrator absorbs altitude-dependent equilibrium
+    -- burner: Create Aeronautics ties lift to atmospheric pressure, so the
+    -- burner level that holds vy=0 rises with altitude. A constant HOVER_BURNER
+    -- isn't right above ~hover-calibration altitude, and over high terrain the
+    -- controller would otherwise stall short of target. The integrator learns
+    -- the offset by accumulating err over time.
+    local now = os.clock()
+    local dt = state.liftLastTick and math.min(math.max(0, now - state.liftLastTick), 1.0) or 0
+    state.liftLastTick = now
+
+    local raw = HOVER_BURNER + LIFT_KP * err + (state.liftIntegral or 0) - LIFT_KD * (state.vy or 0)
+
+    -- Anti-windup: only accumulate when doing so would not push raw further
+    -- into a clamp. Without this the integrator would grow unbounded while
+    -- saturated (e.g. while climbing on max burner) and then overshoot wildly
+    -- on the descent side.
+    local pushingUpIntoCeiling = (raw >= 15 and err > 0)
+    local pushingDownIntoFloor = (raw <= 0  and err < 0)
+    if dt > 0 and not pushingUpIntoCeiling and not pushingDownIntoFloor then
+      state.liftIntegral = (state.liftIntegral or 0) + LIFT_KI * err * dt
+      if state.liftIntegral >  LIFT_I_MAX then state.liftIntegral =  LIFT_I_MAX end
+      if state.liftIntegral < -LIFT_I_MAX then state.liftIntegral = -LIFT_I_MAX end
+    end
+
     if raw < 0 then raw = 0 elseif raw > 15 then raw = 15 end
     desired = math.floor(raw + 0.5)
+
+    -- Stuck-at-ceiling detection. If we're commanding 15 but vy is nearly zero
+    -- while still below target, we've hit the airship's physical ceiling — the
+    -- integrator can't help past 15. Surface that in the OSD via autoStatus.
+    if desired >= 15 and math.abs(state.vy or 0) < 0.05 and err > 3 then
+      state.liftSaturatedSince = state.liftSaturatedSince or now
+    else
+      state.liftSaturatedSince = nil
+    end
   end
 
   if desired > state.burnerLevel then
@@ -1065,7 +1117,9 @@ local function horizontalController()
   end
   if state.phase == "CLIMB_TO_CRUISE" then
     setControl("forward", false); setControl("left", false); setControl("right", false)
-    state.autoStatus = "CLIMB"
+    local stuck = state.liftSaturatedSince
+      and (os.clock() - state.liftSaturatedSince) > CLIMB_STUCK_S
+    state.autoStatus = stuck and "CLIMB MAX" or "CLIMB"
     return
   end
   if state.phase == "LAND" then
@@ -1307,6 +1361,7 @@ local function applyCommand(cmd)
     if state.target then
       state.engaged = not state.engaged
       state.phase = nil
+      resetLiftIntegrator()
       if not state.engaged then
         setControl("forward", false); setControl("left", false); setControl("right", false)
       end
@@ -1319,11 +1374,13 @@ local function applyCommand(cmd)
       state.altHoldActive = true
       state.altHoldTarget = state.altitude
     end
+    resetLiftIntegrator()
   elseif id == "clear_target" then
     state.target = nil
     state.engaged = false
     state.phase = nil
     state.autoStatus = ""
+    resetLiftIntegrator()
     setControl("forward", false); setControl("left", false); setControl("right", false)
   elseif id == "set_target" and type(cmd.target) == "table" then
     state.target = {
@@ -1335,6 +1392,7 @@ local function applyCommand(cmd)
     }
     state.engaged = false
     state.autoStatus = ""
+    resetLiftIntegrator()
 
   -- ---- CLI commands ---------------------------------------------------------
   -- Each handler is the receiving end of a `ship <cmd>` invocation; see
@@ -1348,6 +1406,7 @@ local function applyCommand(cmd)
     state.altHoldTarget = nil
     state.burnerTarget = nil
     state.autoStatus = ""
+    resetLiftIntegrator()
 
   elseif id == "goto_wp" and type(cmd.name) == "string" then
     local target = cmd.name:lower()
@@ -1363,6 +1422,7 @@ local function applyCommand(cmd)
         state.altHoldTarget = nil
         state.burnerTarget = nil
         state.autoStatus = ""
+        resetLiftIntegrator()
         break
       end
     end
@@ -1377,6 +1437,7 @@ local function applyCommand(cmd)
       state.altHoldTarget = nil
       state.burnerTarget = lvl
       state.autoStatus = ""
+      resetLiftIntegrator()
       setControl("forward", false); setControl("left", false); setControl("right", false)
     end
 
@@ -1388,6 +1449,7 @@ local function applyCommand(cmd)
     state.altHoldTarget = nil
     state.burnerTarget = nil
     state.autoStatus = ""
+    resetLiftIntegrator()
     setControl("forward", false); setControl("left", false); setControl("right", false)
 
   elseif id == "hold" then
@@ -1406,6 +1468,7 @@ local function applyCommand(cmd)
       state.altHoldTarget = state.altitude
       state.burnerTarget = nil
     end
+    resetLiftIntegrator()
   end
 end
 
