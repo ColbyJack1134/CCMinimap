@@ -283,6 +283,59 @@ if monitor.setTextScale then monitor.setTextScale(0.5) end
 local width, height = monitor.getSize()
 local unpackValues = table.unpack or unpack
 
+-- Pixel-font rendering for numeric overlays (altitude tape labels, burner
+-- level, speed-dial readout). Vendored morefonts + 3x3-Mono are downloaded
+-- by startup.lua; both are optional -- if either fails to load we fall back
+-- to native 1-char-per-cell blit. 3x3-Mono is a 3px-tall mono font, so each
+-- pixel digit is 1 cell tall and 1-2 cells wide.
+local PIXEL_FONT_PATH = "3x3-Mono"
+local pixelFont
+do
+  local ok, lib = pcall(require, "morefonts")
+  if ok and type(lib) == "table" and lib.writeOn and lib.loadFont then
+    local fontOk = pcall(lib.loadFont, PIXEL_FONT_PATH)
+    if fontOk then pixelFont = lib end
+  end
+end
+
+-- Width in cells that morefonts will paint for `text` at the default options
+-- we use everywhere (3x3-Mono, condense=true, scale=1). Returned as the bbox
+-- caller should treat as dirty for cache invalidation. Height is always 1
+-- cell (3px) for this font.
+local function pixelTextCellSize(text)
+  if not pixelFont then return #text, 1 end
+  local w = pixelFont.calculateTextSize(text, { font = PIXEL_FONT_PATH, condense = true })
+  return math.ceil(w / SUB_W), 1
+end
+
+-- Render numeric text at (col, row) using pixel font when available, else
+-- native blit. fg/bg are blit hex chars. Right-aligned at anchorCol (label's
+-- rightmost cell). Returns (startCol, endCol) so the caller can mark the
+-- bbox cells as dirty in its cache map.
+local function drawPixelLabel(text, row, anchorCol, bg, fg)
+  local widthCells = select(1, pixelTextCellSize(text))
+  local startCol = anchorCol - widthCells + 1
+  if startCol < 1 then startCol = 1 end
+  if pixelFont then
+    monitor.setBackgroundColor(colors.fromBlit(bg))
+    monitor.setTextColor(colors.fromBlit(fg))
+    pixelFont.writeOn(monitor, text, startCol, row, {
+      font = PIXEL_FONT_PATH,
+      condense = true,
+    })
+  else
+    for i = 1, #text do
+      local c = startCol + i - 1
+      if c >= 1 and c <= width then
+        monitor.setCursorPos(c, row)
+        monitor.blit(text:sub(i, i), fg, bg)
+      end
+    end
+  end
+  local endCol = startCol + widthCells - 1
+  return startCol, endCol
+end
+
 -- The pocket has a tight 26x20 screen, so its OSD uses two rows: buttons on
 -- height-1, coord/status on height. The ship's monitor keeps the one-row OSD.
 local function mapHeight()
@@ -680,12 +733,9 @@ local function blitTapeCell(col, row, pattern, fg, bg)
 end
 
 local function drawTapeLabel(text, row, anchorCol, bg, fg)
-  local startCol = anchorCol - #text + 1
-  for i = 1, #text do
-    local c = startCol + i - 1
+  local startCol, endCol = drawPixelLabel(text, row, anchorCol, bg, fg)
+  for c = startCol, endCol do
     if c >= 1 and c <= width then
-      monitor.setCursorPos(c, row)
-      monitor.blit(text:sub(i, i), fg, bg)
       state.lastTapeCells[c * 1024 + row] = true
     end
   end
@@ -738,19 +788,38 @@ local function overlayAltitudeTape(mapH)
   -- cursor is replaced with a yellow marker spelling out the burner level
   -- (so the ship cursor doubles as the burner indicator).
   local altRow = 1 + TAPE_PAD_VERT + math.floor(altSubY / SUB_H)
-  local markerText
-  if state.burnerLevel then
-    markerText = string.format(" %2d", state.burnerLevel):sub(1, TAPE_WIDTH)
-  end
+  local burnerStr
+  if state.burnerLevel then burnerStr = tostring(state.burnerLevel) end
 
   for r = topRow, botRow do
-    if markerText and r == altRow then
-      for i, c in ipairs(cols) do
-        local ch = markerText:sub(i, i)
-        if ch == "" then ch = " " end
+    if burnerStr and r == altRow then
+      -- Solid yellow band across the 3 tape cells with the burner level
+      -- centered on top as a pixel-font numeric (or native fallback). The
+      -- pre-fill ensures single-digit levels still show a full yellow
+      -- marker even if the glyph text doesn't cover all 3 cells.
+      for _, c in ipairs(cols) do
         monitor.setCursorPos(c, r)
-        monitor.blit(ch, BURNER_MARKER_FG, BURNER_MARKER_BG)
+        monitor.blit(" ", BURNER_MARKER_FG, BURNER_MARKER_BG)
         state.lastTapeCells[c * 1024 + r] = true
+      end
+      if pixelFont then
+        local textW = pixelFont.calculateTextSize(burnerStr,
+          { font = PIXEL_FONT_PATH, condense = true })
+        local totalW = TAPE_WIDTH * SUB_W
+        local dx = math.max(0, math.floor((totalW - textW) / 2))
+        monitor.setBackgroundColor(colors.fromBlit(BURNER_MARKER_BG))
+        monitor.setTextColor(colors.fromBlit(BURNER_MARKER_FG))
+        pixelFont.writeOn(monitor, burnerStr, cols[1], r,
+          { font = PIXEL_FONT_PATH, condense = true, dx = dx })
+      else
+        local nt = string.format("%2d", state.burnerLevel):sub(-TAPE_WIDTH)
+        for i = 1, #nt do
+          local c = cols[i + (TAPE_WIDTH - #nt)]
+          if c then
+            monitor.setCursorPos(c, r)
+            monitor.blit(nt:sub(i, i), BURNER_MARKER_FG, BURNER_MARKER_BG)
+          end
+        end
       end
     else
       local rowTopSubY = (r - topRow) * SUB_H
@@ -891,6 +960,24 @@ local function overlaySpeedDial(mapH)
         state.lastDialCells[key] = true
       end
     end
+  end
+
+  -- Velocity readout: rounded integer m/s overlaid on the dial's bottom row,
+  -- horizontally centered. The needle origin and ±90° tick pixels under the
+  -- digits get repainted, but the needle body sweeps the upper two rows so
+  -- it stays readable. Skip entirely when the pixel font failed to load --
+  -- the OSD already shows the floating-point speed as a fallback.
+  if pixelFont then
+    local v = state.velocity
+    local rounded = v >= 0 and math.floor(v + 0.5) or -math.floor(-v + 0.5)
+    local s = tostring(rounded)
+    local textW = pixelFont.calculateTextSize(s,
+      { font = PIXEL_FONT_PATH, condense = true })
+    local dx = math.max(0, math.floor((DIAL_W * SUB_W - textW) / 2))
+    monitor.setBackgroundColor(colors.fromBlit(DIAL_BG))
+    monitor.setTextColor(colors.fromBlit(DIAL_TICK))
+    pixelFont.writeOn(monitor, s, startCol, startRow + DIAL_H - 1,
+      { font = PIXEL_FONT_PATH, condense = true, dx = dx })
   end
 end
 
