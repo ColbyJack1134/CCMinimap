@@ -60,6 +60,11 @@ syncFile("minimap-pocket.lua", "minimap-pocket.lua")
 -- shim below forwards to ship.lua.
 syncFile("ship.lua", "ship.lua")
 
+-- 2b. Pixel-font assets (vendored morefonts + 3x3-Mono). Optional at runtime;
+-- minimap.lua falls back to native chars if either is missing.
+syncFile("morefonts.lua", "morefonts.lua")
+syncFile("3x3-Mono", "3x3-Mono")
+
 -- The long-running program here is minimap-pocket.lua, so `minimap` alone
 -- isn't a thing on the pocket. Drop a thin shim so `minimap <cmd>` and
 -- `minimap --help` work the same as on the ship.
