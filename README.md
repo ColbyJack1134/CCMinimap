@@ -1,3 +1,4 @@
+
 # BlueMap Minimap
 
 Minecraft minimap and autopilot for Create Aeronautics airships, using BlueMap
@@ -5,7 +6,8 @@ and CC:Tweaked.
 
 ## Screenshots
 
-<!-- TODO -->
+<img width="1920" height="1081" alt="2026-05-12_20 14 04" src="https://github.com/user-attachments/assets/510590df-f567-4ef9-8bbd-5784d08e58b2" />
+<img width="1920" height="1081" alt="2026-05-12_20 14 23" src="https://github.com/user-attachments/assets/e6a0f4c1-0c56-4d83-beb9-06f049f47385" />
 
 ## Features
 
