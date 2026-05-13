@@ -244,6 +244,17 @@ def create_app() -> Flask:
     def ship_lua():
         return serve_lua("/app/computercraft/ship.lua")
 
+    # morefonts library + bundled font, used by minimap.lua for pixel-font
+    # rendering of altitude/burner/speed numerics into the teletext mosaic.
+    @app.get("/morefonts.lua")
+    def morefonts_lua():
+        return serve_lua("/app/computercraft/morefonts.lua")
+
+    @app.get("/3x3-Mono")
+    def font_3x3_mono():
+        with open("/app/computercraft/3x3-Mono") as f:
+            return Response(f.read(), mimetype="text/plain; charset=utf-8")
+
     return app
 
 
