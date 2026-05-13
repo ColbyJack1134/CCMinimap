@@ -16,7 +16,7 @@ and CC:Tweaked.
 - Altitude tape with ground line and burner-level marker.
 - Speedometer dial.
 - Tappable waypoints from `waypoints.json` and BlueMap markers.
-- Autopilot: climbs to a cruise AGL setpoint, PD-holds altitude, lands on arrival.
+- Autopilot: climbs to a cruise AGL setpoint, PI-holds altitude, lands on arrival.
 - ALT button for altitude-only hold at current altitude.
 - Pocket remote mirrors ship state over rednet and forwards taps as commands.
 
@@ -31,6 +31,23 @@ and CC:Tweaked.
 | `X` | Clear target |
 
 Tap a waypoint dot or another player to set them as the target.
+
+## CLI
+
+The same commands work from the ship CC, the pocket, or any computer with the
+shared `controlSecret`. Type `minimap` followed by a subcommand:
+
+| Command | Action |
+|---|---|
+| `minimap goto X Z` | Autopilot to coordinate X,Z |
+| `minimap wp <name>` | Autopilot to a named waypoint (tab-completes) |
+| `minimap burner N` | Drive burner to level N (0-15) |
+| `minimap hold [alt]` | Toggle altitude hold (optional explicit altitude) |
+| `minimap stop` | Disengage autopilot, altitude hold, and manual burner |
+| `minimap status` | Print position / heading / mode |
+| `minimap --help` | Full list |
+
+Tab completion is registered on boot for `minimap <sub>` and waypoint names.
 
 ## Dependencies
 
@@ -69,8 +86,10 @@ Install:
 Tune via `minimap.cfg`:
 
 - `channels` / `inputs`: relay and side mapping
-- `hoverBurnerLevel`: burner level that holds altitude steady. Find by trial.
-- `liftKp`, `liftKd`: altitude PD gains. Lower Kp and higher Kd if it oscillates.
+- `hoverBurnerLevel`: starting burner level for the PI controller. Find by trial.
+- `liftKp`, `liftKi`, `liftKd`: altitude PI+D gains. Lower Kp and higher Kd if it
+  oscillates; Ki absorbs altitude-dependent burner equilibrium so AUTO doesn't
+  stall short of target over high terrain.
 - `cruiseAltitudeAboveGround`: target AGL when AUTO is engaged
 - `airshipName`, `controlSecret`: pairing values (see below)
 
