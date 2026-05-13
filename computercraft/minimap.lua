@@ -79,6 +79,15 @@ if not fs.exists(CONFIG_FILE) then
       "side": "front"
     }
   },
+  "outputs": {
+    "lift": {
+      "relay": "redstone_relay_2",
+      "side": "back"
+    }
+  },
+  "liftMode": "burner",
+  "useAltimeter": true,
+  "useVelocitySensor": true,
   "showAltitudeTape": true,
   "showSpeedDial": true,
   "maxAltitude": 320,
@@ -143,6 +152,16 @@ local function cfgInput(name)
   end
   return nil
 end
+local function cfgOutput(name)
+  local cs = cfg.outputs
+  if type(cs) == "table" and type(cs[name]) == "table" then
+    local entry = cs[name]
+    if type(entry.relay) == "string" and type(entry.side) == "string" then
+      return { relay = entry.relay, side = entry.side }
+    end
+  end
+  return nil
+end
 local CHANNELS = {
   forward  = cfgChannel("forward",  { relay = "redstone_relay_0", side = "back"  }),
   back     = cfgChannel("back",     { relay = "redstone_relay_0", side = "top"   }),
@@ -154,6 +173,12 @@ local CHANNELS = {
 local INPUTS = {
   liftLevel = cfgInput("liftLevel"),
 }
+local OUTPUTS = {
+  lift = cfgOutput("lift"),
+}
+local LIFT_MODE = (cfg.liftMode == "direct") and "direct" or "burner"
+local USE_ALTIMETER = (cfg.useAltimeter ~= false)
+local USE_VELOCITY_SENSOR = (cfg.useVelocitySensor ~= false)
 
 local relayCache = {}
 local function wrapRelay(name)
@@ -173,9 +198,10 @@ local Lift
 if not IS_POCKET then
   Lift = dofile("lift.lua")
   Lift.init({
-    mode = "burner",
+    mode = LIFT_MODE,
     channels = CHANNELS,
     inputs = INPUTS,
+    outputs = OUTPUTS,
     pulseSeconds = tonumber(cfg.liftPulseSeconds) or 0.2,
   })
 end
@@ -647,7 +673,16 @@ local function overlayDotTrail(cx, cz, mapH)
   end
 end
 
+-- GPS altitude fallback. Computer y-position comes back coarse (often integer)
+-- so the value gets EWMA-smoothed before being handed to the PID; otherwise the
+-- D term chatters on the per-tick step changes.
+local altEwma = nil
 local function readAltitude()
+  if not USE_ALTIMETER then
+    if not state.lastPos or state.lastPos.y == nil then return state.altitude end
+    altEwma = altEwma and (altEwma * 0.7 + state.lastPos.y * 0.3) or state.lastPos.y
+    return altEwma
+  end
   if not altSensor then return nil end
   local ok, h = pcall(altSensor.getHeight)
   if ok and type(h) == "number" then return h end
@@ -657,7 +692,31 @@ local function readPressure()
   local ok, pr = pcall(altSensor.getAirPressure)
   if ok and type(pr) == "number" then return pr end
 end
+
+-- GPS velocity fallback: signed forward speed = horizontal position delta
+-- projected onto the heading vector, sampled over a ~0.5s window and EWMA'd.
+-- Magnitude-only would lose the negative half-circle of the speed dial.
+local velSample, velEwma = nil, 0
 local function readVelocity()
+  if not USE_VELOCITY_SENSOR then
+    if not state.lastPos then return state.velocity end
+    local now = os.clock()
+    if not velSample then
+      velSample = { t = now, x = state.lastPos.x, z = state.lastPos.z }
+      return 0
+    end
+    local dt = now - velSample.t
+    if dt < 0.5 then return velEwma end
+    local dx = state.lastPos.x - velSample.x
+    local dz = state.lastPos.z - velSample.z
+    -- MC compass: 0=N=-Z, 90=E=+X. Forward unit vector for heading h.
+    local rad = math.rad(state.shipHeading or 0)
+    local fwdX, fwdZ = math.sin(rad), -math.cos(rad)
+    local signed = (dx * fwdX + dz * fwdZ) / dt
+    velEwma = velEwma * 0.6 + signed * 0.4
+    velSample = { t = now, x = state.lastPos.x, z = state.lastPos.z }
+    return velEwma
+  end
   if not velSensor then return nil end
   local ok, v = pcall(velSensor.getVelocity)
   if ok and type(v) == "number" then
