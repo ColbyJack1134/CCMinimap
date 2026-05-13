@@ -59,13 +59,6 @@ syncFile("minimap.lua")
 -- forwards to ship.lua when called with args.
 syncFile("ship.lua")
 
--- 2b. Pixel-font assets. morefonts.lua does sub-cell text rendering into the
--- teletext mosaic; the bundled font file is a vendored copy of 3x3-Mono.
--- Both are optional at runtime: minimap.lua falls back to native chars if
--- either is missing or fails to load.
-syncFile("morefonts.lua")
-syncFile("3x3-Mono")
-
 -- Pretty-print a JSON-like Lua value with 2-space indent. Object keys are
 -- sorted alphabetically so the on-disk config is stable across boots; Lua
 -- tables don't preserve insertion order so we have to pick *some* order.
