@@ -164,6 +164,22 @@ local function wrapRelay(name)
   return relayCache[name]
 end
 
+-- Lift driver: pulse-based burner mode (default) is what the original CCMinimap
+-- rig uses (liftUp/liftDown pulse channels + liftLevel analog feedback). The
+-- module is shared with Spruce, which uses a direct-output variant for cheap
+-- drones. minimap.lua talks to it through commandLevel/currentLevel/idle.
+-- Pocket has no relays so it skips the load entirely.
+local Lift
+if not IS_POCKET then
+  Lift = dofile("lift.lua")
+  Lift.init({
+    mode = "burner",
+    channels = CHANNELS,
+    inputs = INPUTS,
+    pulseSeconds = tonumber(cfg.liftPulseSeconds) or 0.2,
+  })
+end
+
 local altSensor = peripheral.find("altitude_sensor")
 local velSensor = peripheral.find("velocity_sensor")
 
@@ -204,7 +220,6 @@ local LIFT_KD           = tonumber(cfg.liftKd) or 1.2
 local LIFT_KI           = tonumber(cfg.liftKi) or 0.05
 local LIFT_I_MAX        = 8       -- |integrator| cap to bound anti-windup error
 local CLIMB_STUCK_S     = 3       -- seconds saturated-at-15 before surfacing CLIMB MAX
-local LIFT_PULSE_S      = tonumber(cfg.liftPulseSeconds) or 0.2
 local LAND_RAMP_S       = tonumber(cfg.landRampSeconds) or 2.0
 local CLIMB_DONE_MARGIN = 5    -- blocks below cruise that count as "arrived at cruise"
 local RECOVER_MARGIN    = 10   -- exit STOP_AND_RISE this many blocks above MIN_ALT_AGL
@@ -904,42 +919,8 @@ local function setControl(name, on)
   pcall(r.setOutput, ch.side, on)
 end
 
--- Pulse-driven channels (liftUp/liftDown): rising edge triggers burner +/-1.
--- Cycle is LIFT_PULSE_S HIGH then LIFT_PULSE_S LOW before another pulse can fire.
-local pulseState = {}  -- name -> { stage = "on" | "off", endsAt = clock }
-
-local function tickPulses()
-  local now = os.clock()
-  local done = {}
-  for name, p in pairs(pulseState) do
-    if now >= p.endsAt then
-      if p.stage == "on" then
-        setControl(name, false)
-        p.stage = "off"
-        p.endsAt = now + LIFT_PULSE_S
-      else
-        done[#done + 1] = name
-      end
-    end
-  end
-  for _, n in ipairs(done) do pulseState[n] = nil end
-end
-
-local function pulseChannel(name)
-  if pulseState[name] then return false end
-  if not CHANNELS[name] then return false end
-  setControl(name, true)
-  pulseState[name] = { stage = "on", endsAt = os.clock() + LIFT_PULSE_S }
-  return true
-end
-
 local function updateBurnerLevel()
-  local inp = INPUTS.liftLevel
-  if not inp then return end
-  local r = wrapRelay(inp.relay)
-  if not r or type(r.getAnalogInput) ~= "function" then return end
-  local ok, v = pcall(r.getAnalogInput, inp.side)
-  if ok and type(v) == "number" then state.burnerLevel = v end
+  state.burnerLevel = Lift.currentLevel()
 end
 
 local function updateVy()
@@ -1022,10 +1003,9 @@ local function altitudeController()
     -- Idle: hand the burner back to the manual +/- controller on the same
     -- signals. Drop any in-flight pulse and force the outputs LOW so we
     -- never fight a person holding the button.
-    pulseState.liftUp = nil
-    pulseState.liftDown = nil
-    if state.controls.liftUp then setControl("liftUp", false) end
-    if state.controls.liftDown then setControl("liftDown", false) end
+    Lift.idle()
+    state.controls.liftUp = false
+    state.controls.liftDown = false
     resetLiftIntegrator()
     return
   end
@@ -1040,11 +1020,7 @@ local function altitudeController()
       state.burnerTarget = nil
       return
     end
-    if state.burnerLevel < state.burnerTarget then
-      pulseChannel("liftUp")
-    else
-      pulseChannel("liftDown")
-    end
+    Lift.commandLevel(state.burnerTarget)
     return
   end
 
@@ -1103,11 +1079,7 @@ local function altitudeController()
     end
   end
 
-  if desired > state.burnerLevel then
-    pulseChannel("liftUp")
-  elseif desired < state.burnerLevel then
-    pulseChannel("liftDown")
-  end
+  Lift.commandLevel(desired)
 end
 
 local function horizontalController()
@@ -1147,7 +1119,7 @@ local function horizontalController()
 end
 
 local function autopilotTick()
-  tickPulses()
+  Lift.tick()
   updatePhase()
   horizontalController()
   altitudeController()
@@ -1606,7 +1578,7 @@ end
 local function resetAllOutputs()
   if IS_POCKET then return end
   for name in pairs(CHANNELS) do setControl(name, false) end
-  for k in pairs(pulseState) do pulseState[k] = nil end
+  Lift.idle()
 end
 
 monitor.setBackgroundColor(colors.black)

@@ -59,6 +59,10 @@ syncFile("minimap.lua")
 -- forwards to ship.lua when called with args.
 syncFile("ship.lua")
 
+-- 2b. Lift driver module (shared between CCMinimap and Spruce). Synced
+-- before minimap.lua launches so the `dofile("lift.lua")` succeeds.
+syncFile("lift.lua")
+
 -- Pretty-print a JSON-like Lua value with 2-space indent. Object keys are
 -- sorted alphabetically so the on-disk config is stable across boots; Lua
 -- tables don't preserve insertion order so we have to pick *some* order.
