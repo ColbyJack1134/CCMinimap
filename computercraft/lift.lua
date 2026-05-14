@@ -108,16 +108,28 @@ function Lift.currentLevel()
   return trackedLevel
 end
 
--- Drive the burner toward `level` (0..15). In burner mode this is one +/-1
--- pulse per tick; the controller is expected to keep calling each tick until
--- currentLevel() matches. In direct mode this is one-shot setAnalogOutput.
+-- Drive the burner toward `level` (0..15). Both modes step by at most +/-1
+-- per call: burner mode pulses liftUp/liftDown once, direct mode writes
+-- trackedLevel+/-1 to setAnalogOutput. The controller is expected to keep
+-- calling each tick until currentLevel() matches.
+--
+-- Direct mode needs this slew limit because the PID is tuned around the
+-- burner-mode rig, where the pulse cycle naturally rate-limits the burner.
+-- Without it, a single tick of high vy makes raw clamp to 0 and the analog
+-- output slams the burner OFF (then the next tick slams it to 15, etc).
 function Lift.commandLevel(level)
   if type(level) ~= "number" then return end
   level = math.max(0, math.min(15, math.floor(level + 0.5)))
   if config.mode == "direct" then
+    local cur = trackedLevel or 0
+    local step
+    if level > cur then step = cur + 1
+    elseif level < cur then step = cur - 1
+    else step = cur
+    end
     local out = config.outputs.lift
-    if out then setAnalogOutput(out.relay, out.side, level) end
-    trackedLevel = level
+    if out then setAnalogOutput(out.relay, out.side, step) end
+    trackedLevel = step
     return
   end
   local cur = Lift.currentLevel()
