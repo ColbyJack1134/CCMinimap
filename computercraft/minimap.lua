@@ -196,8 +196,10 @@ end
 -- drones. minimap.lua talks to it through commandLevel/currentLevel/idle.
 -- Pocket has no relays so it skips the load entirely.
 local Lift
+local Altitude
 if not IS_POCKET then
   Lift = dofile("lift.lua")
+  Altitude = dofile("altitude.lua")
   Lift.init({
     mode = LIFT_MODE,
     channels = CHANNELS,
@@ -1105,40 +1107,20 @@ local function altitudeController()
       targetAlt = state.altHoldTarget
     end
     if not targetAlt then return end
-    local err = targetAlt - state.altitude
 
-    -- PI + D-on-velocity. The integrator absorbs altitude-dependent equilibrium
-    -- burner: Create Aeronautics ties lift to atmospheric pressure, so the
-    -- burner level that holds vy=0 rises with altitude. A constant HOVER_BURNER
-    -- isn't right above ~hover-calibration altitude, and over high terrain the
-    -- controller would otherwise stall short of target. The integrator learns
-    -- the offset by accumulating err over time.
-    local now = os.clock()
-    local dt = state.liftLastTick and math.min(math.max(0, now - state.liftLastTick), 1.0) or 0
-    state.liftLastTick = now
-
-    local raw = HOVER_BURNER + LIFT_KP * err + (state.liftIntegral or 0) - LIFT_KD * (state.vy or 0)
-
-    -- Anti-windup: only accumulate when doing so would not push raw further
-    -- into a clamp. Without this the integrator would grow unbounded while
-    -- saturated (e.g. while climbing on max burner) and then overshoot wildly
-    -- on the descent side.
-    local pushingUpIntoCeiling = (raw >= 15 and err > 0)
-    local pushingDownIntoFloor = (raw <= MIN_BURNER and err < 0)
-    if dt > 0 and not pushingUpIntoCeiling and not pushingDownIntoFloor then
-      state.liftIntegral = (state.liftIntegral or 0) + LIFT_KI * err * dt
-      if state.liftIntegral >  LIFT_I_MAX then state.liftIntegral =  LIFT_I_MAX end
-      if state.liftIntegral < -LIFT_I_MAX then state.liftIntegral = -LIFT_I_MAX end
-    end
-
-    if raw < MIN_BURNER then raw = MIN_BURNER elseif raw > 15 then raw = 15 end
-    desired = math.floor(raw + 0.5)
-
-    -- Stuck-at-ceiling detection. If we're commanding 15 but vy is nearly zero
-    -- while still below target, we've hit the airship's physical ceiling — the
-    -- integrator can't help past 15. Surface that in the OSD via autoStatus.
-    if desired >= 15 and math.abs(state.vy or 0) < 0.05 and err > 3 then
-      state.liftSaturatedSince = state.liftSaturatedSince or now
+    -- Delegate PI + D-on-velocity to the shared altitude.lua. Integrator
+    -- state lives on `state.lift*` so it survives the function call and
+    -- gets reset by the existing reset paths (engagement edges, etc.).
+    local pid = { integral = state.liftIntegral or 0, lastTick = state.liftLastTick }
+    local d, saturated = Altitude.tick(pid, state.altitude, state.vy, targetAlt, {
+      HOVER = HOVER_BURNER, MIN_BURNER = MIN_BURNER,
+      KP = LIFT_KP, KI = LIFT_KI, KD = LIFT_KD, I_MAX = LIFT_I_MAX,
+    })
+    state.liftIntegral = pid.integral
+    state.liftLastTick = pid.lastTick
+    desired = d
+    if saturated then
+      state.liftSaturatedSince = state.liftSaturatedSince or os.clock()
     else
       state.liftSaturatedSince = nil
     end
