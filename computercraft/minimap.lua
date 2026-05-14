@@ -1637,7 +1637,7 @@ end
 local function resetAllOutputs()
   if IS_POCKET then return end
   for name in pairs(CHANNELS) do setControl(name, false) end
-  Lift.idle()
+  Lift.reset()
 end
 
 monitor.setBackgroundColor(colors.black)

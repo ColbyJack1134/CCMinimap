@@ -128,13 +128,19 @@ function Lift.commandLevel(level)
   end
 end
 
--- Release every lift output and drop in-flight pulses. Used when leaving
--- AUTO/HOLD/manual modes so the operator's manual buttons aren't fought.
+-- Release control of the lift. Used when leaving AUTO/HOLD/manual modes.
+--
+-- Burner mode: drop any in-flight pulse and force the up/down relays LOW so
+-- the operator's manual +/- buttons (wired to the same relay outputs) aren't
+-- fought by stale CC outputs. Create's stockpile switch keeps the burner at
+-- its current level, so the ship hovers.
+--
+-- Direct mode: FREEZE -- leave the analog output where it was. The redstone
+-- relay block holds the last value across CC inactivity, so the burner stays
+-- where the last command put it. Without this the ship dropped to 0 after
+-- landing (overwriting landBurnerLevel) or after STOP (overwriting cruise).
 function Lift.idle()
   if config.mode == "direct" then
-    local out = config.outputs.lift
-    if out then setAnalogOutput(out.relay, out.side, 0) end
-    trackedLevel = 0
     return
   end
   pulseState.liftUp = nil
@@ -144,6 +150,19 @@ function Lift.idle()
   if cu then setOutput(cu.relay, cu.side, false) end
   if cd then setOutput(cd.relay, cd.side, false) end
   trackedLevel = nil
+end
+
+-- Hard reset to a known-safe state. Only called at boot, since the redstone
+-- relay block remembers its last analog level across CC reboots and a stale
+-- "15" left over from a previous session would slam the burner on startup.
+function Lift.reset()
+  if config.mode == "direct" then
+    local out = config.outputs.lift
+    if out then setAnalogOutput(out.relay, out.side, 0) end
+    trackedLevel = 0
+    return
+  end
+  Lift.idle()
 end
 
 return Lift
