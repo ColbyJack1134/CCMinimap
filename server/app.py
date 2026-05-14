@@ -248,6 +248,10 @@ def create_app() -> Flask:
     def lift_lua():
         return serve_lua("/app/computercraft/lift.lua")
 
+    @app.get("/cfgutil.lua")
+    def cfgutil_lua():
+        return serve_lua("/app/computercraft/cfgutil.lua")
+
     return app
 
 

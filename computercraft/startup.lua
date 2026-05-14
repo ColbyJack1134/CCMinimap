@@ -59,42 +59,16 @@ syncFile("minimap.lua")
 -- forwards to ship.lua when called with args.
 syncFile("ship.lua")
 
--- 2b. Lift driver module (shared between CCMinimap and Spruce). Synced
--- before minimap.lua launches so the `dofile("lift.lua")` succeeds.
+-- 2b. Shared Lua modules (shared between CCMinimap and Spruce). Synced
+-- before minimap.lua launches so its `dofile(...)` calls succeed.
 syncFile("lift.lua")
-
--- Pretty-print a JSON-like Lua value with 2-space indent. Object keys are
--- sorted alphabetically so the on-disk config is stable across boots; Lua
--- tables don't preserve insertion order so we have to pick *some* order.
-local function jsonPretty(value, indent)
-  indent = indent or 0
-  if type(value) ~= "table" then return textutils.serialiseJSON(value) end
-  local n, isArray = 0, true
-  for k, _ in pairs(value) do
-    n = n + 1
-    if type(k) ~= "number" or k ~= math.floor(k) or k < 1 then isArray = false end
-  end
-  if n == 0 then return "{}" end
-  local pad      = string.rep("  ", indent)
-  local innerPad = string.rep("  ", indent + 1)
-  if isArray and n == #value then
-    local parts = {}
-    for i = 1, n do parts[i] = innerPad .. jsonPretty(value[i], indent + 1) end
-    return "[\n" .. table.concat(parts, ",\n") .. "\n" .. pad .. "]"
-  end
-  local keys = {}
-  for k, _ in pairs(value) do keys[#keys + 1] = tostring(k) end
-  table.sort(keys)
-  local parts = {}
-  for i, k in ipairs(keys) do
-    parts[i] = innerPad .. textutils.serialiseJSON(k) .. ": " .. jsonPretty(value[k], indent + 1)
-  end
-  return "{\n" .. table.concat(parts, ",\n") .. "\n" .. pad .. "}"
-end
+syncFile("cfgutil.lua")
+local Cfg = dofile("cfgutil.lua")
 
 -- 3. Merge new default config keys without overwriting existing ones, then
 -- write the result back in pretty form. Writing every boot canonicalises the
--- layout (compact configs from earlier builds get auto-beautified).
+-- layout (compact configs from earlier builds get auto-beautified) and lets
+-- new nested defaults (e.g. a new channel) propagate to existing configs.
 local defaults = fetchJson(SERVER .. "/config.defaults")
 if type(defaults) == "table" then
   local raw = readFile(CONFIG)
@@ -104,14 +78,8 @@ if type(defaults) == "table" then
     if ok and type(parsed) == "table" then current = parsed end
   end
   current = current or {}
-  local added = {}
-  for k, v in pairs(defaults) do
-    if current[k] == nil then
-      current[k] = v
-      added[#added + 1] = k
-    end
-  end
-  local serialized = jsonPretty(current) .. "\n"
+  local added = Cfg.deepMergeMissing(defaults, current)
+  local serialized = Cfg.jsonPretty(current) .. "\n"
   if readFile(CONFIG) ~= serialized then
     writeFile(CONFIG, serialized)
     if #added > 0 then
