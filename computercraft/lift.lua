@@ -36,13 +36,25 @@ local function wrapRelay(name)
   return relayCache[name]
 end
 
+-- An empty/nil relay means "wire goes straight to a side of this computer",
+-- which is how cheap turtle drones are built. Fall back to the local redstone
+-- API in that case. CCMinimap rigs always pass a real relay name so they
+-- keep going through the redstone_relay peripheral.
 local function setOutput(relayName, side, on)
+  if not relayName or relayName == "" then
+    pcall(redstone.setOutput, side, on and true or false)
+    return
+  end
   local r = wrapRelay(relayName)
   if not r or type(r.setOutput) ~= "function" then return end
   pcall(r.setOutput, side, on and true or false)
 end
 
 local function setAnalogOutput(relayName, side, level)
+  if not relayName or relayName == "" then
+    pcall(redstone.setAnalogOutput, side, level)
+    return
+  end
   local r = wrapRelay(relayName)
   if not r or type(r.setAnalogOutput) ~= "function" then return end
   pcall(r.setAnalogOutput, side, level)
