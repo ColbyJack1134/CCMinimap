@@ -55,7 +55,12 @@ function Lift.init(opts)
   config.outputs  = config.outputs  or {}
   config.pulseSeconds = config.pulseSeconds or 0.2
   pulseState = {}
-  trackedLevel = nil
+  -- Burner mode reads ground truth from the analog input, so we start
+  -- "unknown" (nil) until that input is read. Direct mode is open-loop:
+  -- the level we last set IS the truth, and at boot we haven't set
+  -- anything, so seed it to 0 so callers see "Bn0" instead of nothing
+  -- and the PID's `if not burnerLevel then return` guard doesn't block.
+  trackedLevel = (config.mode == "direct") and 0 or nil
 end
 
 local function pulseChannel(name)
@@ -129,7 +134,7 @@ function Lift.idle()
   if config.mode == "direct" then
     local out = config.outputs.lift
     if out then setAnalogOutput(out.relay, out.side, 0) end
-    trackedLevel = nil
+    trackedLevel = 0
     return
   end
   pulseState.liftUp = nil
