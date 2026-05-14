@@ -97,6 +97,7 @@ if not fs.exists(CONFIG_FILE) then
   "cruiseAltitudeAboveGround": 50,
   "minAltitudeAboveGround": 20,
   "hoverBurnerLevel": 7,
+  "minBurnerLevel": 0,
   "landBurnerLevel": 3,
   "liftKp": 0.4,
   "liftKd": 1.2,
@@ -240,6 +241,11 @@ local VELOCITY_FLIPPED = (cfg.velocityFlipped ~= false)
 local CRUISE_ALT_AGL    = tonumber(cfg.cruiseAltitudeAboveGround) or 50
 local MIN_ALT_AGL       = tonumber(cfg.minAltitudeAboveGround) or 20
 local HOVER_BURNER      = tonumber(cfg.hoverBurnerLevel) or 7
+-- Floor on the PID-commanded burner level. The pure [0,15] clamp lets the
+-- controller drop the burner to 0 when asking for descent, which on heavier
+-- builds means free-fall rather than a controlled glide. Setting this to a
+-- small positive value (e.g. 3-5) keeps a baseline lift so descent is gentle.
+local MIN_BURNER        = tonumber(cfg.minBurnerLevel) or 0
 local LAND_BURNER       = tonumber(cfg.landBurnerLevel) or 3
 local LIFT_KP           = tonumber(cfg.liftKp) or 0.4
 local LIFT_KD           = tonumber(cfg.liftKd) or 1.2
@@ -1118,14 +1124,14 @@ local function altitudeController()
     -- saturated (e.g. while climbing on max burner) and then overshoot wildly
     -- on the descent side.
     local pushingUpIntoCeiling = (raw >= 15 and err > 0)
-    local pushingDownIntoFloor = (raw <= 0  and err < 0)
+    local pushingDownIntoFloor = (raw <= MIN_BURNER and err < 0)
     if dt > 0 and not pushingUpIntoCeiling and not pushingDownIntoFloor then
       state.liftIntegral = (state.liftIntegral or 0) + LIFT_KI * err * dt
       if state.liftIntegral >  LIFT_I_MAX then state.liftIntegral =  LIFT_I_MAX end
       if state.liftIntegral < -LIFT_I_MAX then state.liftIntegral = -LIFT_I_MAX end
     end
 
-    if raw < 0 then raw = 0 elseif raw > 15 then raw = 15 end
+    if raw < MIN_BURNER then raw = MIN_BURNER elseif raw > 15 then raw = 15 end
     desired = math.floor(raw + 0.5)
 
     -- Stuck-at-ceiling detection. If we're commanding 15 but vy is nearly zero
