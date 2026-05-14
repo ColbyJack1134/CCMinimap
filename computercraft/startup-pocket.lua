@@ -68,33 +68,8 @@ if readFile("minimap.lua") ~= minimapShim then
   writeFile("minimap.lua", minimapShim)
 end
 
--- Pretty-print a JSON-like Lua value with 2-space indent. Object keys are
--- sorted alphabetically so the on-disk config is stable across boots.
-local function jsonPretty(value, indent)
-  indent = indent or 0
-  if type(value) ~= "table" then return textutils.serialiseJSON(value) end
-  local n, isArray = 0, true
-  for k, _ in pairs(value) do
-    n = n + 1
-    if type(k) ~= "number" or k ~= math.floor(k) or k < 1 then isArray = false end
-  end
-  if n == 0 then return "{}" end
-  local pad      = string.rep("  ", indent)
-  local innerPad = string.rep("  ", indent + 1)
-  if isArray and n == #value then
-    local parts = {}
-    for i = 1, n do parts[i] = innerPad .. jsonPretty(value[i], indent + 1) end
-    return "[\n" .. table.concat(parts, ",\n") .. "\n" .. pad .. "]"
-  end
-  local keys = {}
-  for k, _ in pairs(value) do keys[#keys + 1] = tostring(k) end
-  table.sort(keys)
-  local parts = {}
-  for i, k in ipairs(keys) do
-    parts[i] = innerPad .. textutils.serialiseJSON(k) .. ": " .. jsonPretty(value[k], indent + 1)
-  end
-  return "{\n" .. table.concat(parts, ",\n") .. "\n" .. pad .. "}"
-end
+syncFile("cfgutil.lua", "cfgutil.lua")
+local Cfg = dofile("cfgutil.lua")
 
 -- 3. Merge any new default config keys into minimap-pocket.cfg without overwriting.
 -- Only pocket-relevant keys; the ship owns controller/peripheral tunables.
@@ -109,14 +84,8 @@ if type(defaults) == "table" then
     if ok and type(parsed) == "table" then current = parsed end
   end
   current = current or {}
-  local added = {}
-  for k, v in pairs(defaults) do
-    if current[k] == nil then
-      current[k] = v
-      added[#added + 1] = k
-    end
-  end
-  local serialized = jsonPretty(current) .. "\n"
+  local added = Cfg.deepMergeMissing(defaults, current)
+  local serialized = Cfg.jsonPretty(current) .. "\n"
   if readFile(CONFIG) ~= serialized then
     writeFile(CONFIG, serialized)
     if #added > 0 then
