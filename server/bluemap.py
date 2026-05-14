@@ -150,21 +150,36 @@ class BlueMapClient:
         local_z = (z - tile_z * world_tile_size) / lod_scale
         return tile_x, tile_z, local_x, local_z, lod_scale
 
-    def sample_ground_height(self, x: float, z: float, chunk_radius: int = 1) -> dict:
+    def sample_ground_height(
+        self, x: float, z: float,
+        chunk_radius: int = 1, radius_blocks: int | None = None,
+    ) -> dict:
         """Sample surface Y from BlueMap LOD-1 lowres heightmap.
 
         BlueMap lowres tiles are 501x1002 PNGs: top half (y<tileSize+1) is the
         color image, bottom half is per-block metadata. The blue channel of
         the bottom half = surface y-level at that block.
 
-        Returns max/min ground Y across a (2*chunk_radius+1)x(2*chunk_radius+1)
-        chunk window centered on (x, z), plus sample/miss counters.
+        Window selection:
+        - If radius_blocks is given (non-None), the sampled square is
+          (2*radius_blocks+1) blocks on a side. Use this when you want
+          fine-grained control (e.g. a 20x20 window for a hovering drone
+          that mustn't lift to a nearby mountain peak).
+        - Otherwise, chunk_radius controls a (2*chunk_radius+1) CHUNK window
+          (i.e. multiples of 16). Kept for back-compat callers.
+
+        Returns max/min ground Y across the window, plus sample/miss counters.
         """
-        if chunk_radius < 0 or chunk_radius > 8:
-            raise BlueMapError("chunk_radius must be between 0 and 8")
+        if radius_blocks is not None:
+            if radius_blocks < 0 or radius_blocks > 256:
+                raise BlueMapError("radius_blocks must be between 0 and 256")
+            window_blocks = 2 * radius_blocks + 1
+        else:
+            if chunk_radius < 0 or chunk_radius > 8:
+                raise BlueMapError("chunk_radius must be between 0 and 8")
+            window_blocks = (2 * chunk_radius + 1) * 16
         lowres = self.lowres_settings()
         tile_size = lowres.tile_size
-        window_blocks = (2 * chunk_radius + 1) * 16
         half = window_blocks // 2
         cx, cz = math.floor(x), math.floor(z)
         wx_min, wx_max = cx - half, cx - half + window_blocks - 1
@@ -204,7 +219,8 @@ class BlueMapClient:
         return {
             "groundMaxY": max_y,
             "groundMinY": min_y,
-            "chunkRadius": chunk_radius,
+            "chunkRadius": chunk_radius if radius_blocks is None else None,
+            "radiusBlocks": radius_blocks,
             "windowBlocks": window_blocks,
             "samples": samples,
             "missingTiles": missing_tiles,
