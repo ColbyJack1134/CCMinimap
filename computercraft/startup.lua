@@ -62,6 +62,7 @@ syncFile("ship.lua")
 -- 2b. Shared Lua modules (shared between CCMinimap and Spruce). Synced
 -- before minimap.lua launches so its `dofile(...)` calls succeed.
 syncFile("lift.lua")
+syncFile("altitude.lua")
 syncFile("cfgutil.lua")
 local Cfg = dofile("cfgutil.lua")
 
