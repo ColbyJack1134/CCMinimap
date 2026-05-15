@@ -152,6 +152,24 @@ function Lift.commandLevel(level)
   end
 end
 
+-- Set the burner level directly, bypassing the slew limit. Use this for
+-- explicit manual commands (`burner 5`) where the operator wants the
+-- burner to jump straight to a value -- not the PID-pacing path. In
+-- burner mode there's still no way to "jump" without a stockpile-switch
+-- transaction; fall back to commandLevel so the pulse driver gets us
+-- there in N ticks.
+function Lift.setLevel(level)
+  if type(level) ~= "number" then return end
+  level = math.max(0, math.min(15, math.floor(level + 0.5)))
+  if config.mode == "direct" then
+    local out = config.outputs.lift
+    if out then setAnalogOutput(out.relay, out.side, level) end
+    trackedLevel = level
+    return
+  end
+  Lift.commandLevel(level)
+end
+
 -- Release control of the lift. Used when leaving AUTO/HOLD/manual modes.
 --
 -- Burner mode: drop any in-flight pulse and force the up/down relays LOW so
