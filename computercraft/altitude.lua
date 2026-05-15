@@ -24,6 +24,7 @@ local M = {}
 local DEFAULTS = {
   HOVER      = 7,
   MIN_BURNER = 0,
+  MAX_BURNER = 15,
   KP         = 0.4,
   KI         = 0.05,
   KD         = 1.2,
@@ -33,14 +34,15 @@ local DEFAULTS = {
 
 -- One PID iteration. Mutates `pid.integral` and `pid.lastTick` in place.
 -- Returns:
---   desired   integer burner level in [MIN_BURNER, 15]
---   saturated true when we're commanding 15, vy is nearly zero, and still
---             below target -- the airship has hit its physical ceiling and
---             the integrator can't help. Surface this in UI/logs.
+--   desired   integer burner level in [MIN_BURNER, MAX_BURNER]
+--   saturated true when we're commanding MAX_BURNER, vy is nearly zero,
+--             and still below target -- the airship has hit its physical
+--             ceiling and the integrator can't help. Surface this in UI/logs.
 function M.tick(pid, currentAlt, currentVy, targetAlt, gains)
   local g = gains or {}
   local HOVER      = g.HOVER      or DEFAULTS.HOVER
   local MIN_BURNER = g.MIN_BURNER or DEFAULTS.MIN_BURNER
+  local MAX_BURNER = g.MAX_BURNER or DEFAULTS.MAX_BURNER
   local KP         = g.KP         or DEFAULTS.KP
   local KI         = g.KI         or DEFAULTS.KI
   local KD         = g.KD         or DEFAULTS.KD
@@ -58,7 +60,7 @@ function M.tick(pid, currentAlt, currentVy, targetAlt, gains)
   -- Anti-windup: only accumulate when doing so wouldn't push raw further
   -- into the clamp. Without this the integrator grows unbounded while
   -- saturated and then overshoots wildly when the error sign flips.
-  local pushingUpIntoCeiling = (raw >= 15 and err > 0)
+  local pushingUpIntoCeiling = (raw >= MAX_BURNER and err > 0)
   local pushingDownIntoFloor = (raw <= MIN_BURNER and err < 0)
   if dt > 0 and not pushingUpIntoCeiling and not pushingDownIntoFloor then
     integral = integral + KI * err * dt
@@ -68,10 +70,10 @@ function M.tick(pid, currentAlt, currentVy, targetAlt, gains)
   pid.integral = integral
 
   if raw < MIN_BURNER then raw = MIN_BURNER end
-  if raw > 15 then raw = 15 end
+  if raw > MAX_BURNER then raw = MAX_BURNER end
   local desired = math.floor(raw + 0.5)
 
-  local saturated = (desired >= 15) and (math.abs(vy) < 0.05) and (err > 3)
+  local saturated = (desired >= MAX_BURNER) and (math.abs(vy) < 0.05) and (err > 3)
   return desired, saturated
 end
 
