@@ -3047,7 +3047,8 @@ state._startPinHold = function(x, y, requireRepeat)
   if state.pinHoldEnabled and state.screen == "map" and state.lastPos and state.hasMap and y <= mapHeight() then
     local cx, cz = mapCenter()
     local wx, wz = cellToWorld(x, y, cx, cz, mapHeight())
-    state.pinHold = { x = x, y = y, wx = wx, wz = wz, timer = os.startTimer(0.7) }
+    state.pinHold = { x = x, y = y, wx = wx, wz = wz, timer = os.startTimer(0.7),
+                      requireRepeat = requireRepeat == true }
   end
 end
 
@@ -3276,7 +3277,9 @@ local function eventLoop()
       elseif state.pinHold and event[2] == state.pinHold.timer then
         local hold = state.pinHold
         state.pinHold = nil
-        state._placePinWorld(hold.wx, hold.wz, false)
+        if not hold.requireRepeat or hold.seenAgain then
+          state._placePinWorld(hold.wx, hold.wz, false)
+        end
       end
     elseif event[1] == "term_resize" then
       width, height = monitor.getSize()
