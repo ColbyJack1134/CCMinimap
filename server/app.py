@@ -53,6 +53,30 @@ def _frame_cache_put(key: tuple, result: dict) -> None:
         _frame_cache.pop(old, None)
 
 
+# Waypoint color names the CC client understands (minimap-ui.lua NAMED_HEX),
+# keyed by the map-palette slot each name renders as.  BlueMap shape markers
+# send {r,g,b,a} objects instead of names; quantize those against each slot's
+# actual rgb so the picked name looks right on screen.
+_WAYPOINT_NAMED_SLOTS = {
+    "white": 0x0, "yellow": 0x1, "red": 0x2, "cyan": 0x3, "lime": 0x4,
+    "darkgreen": 0x5, "lightgray": 0x6, "gray": 0x8, "blue": 0x9,
+    "brown": 0xC, "green": 0xD, "orange": 0xE, "black": 0xF,
+}
+
+
+def _marker_color(marker: dict) -> str:
+    color = marker.get("lineColor") or marker.get("fillColor") or "yellow"
+    if not isinstance(color, dict):
+        return color
+    rgb = (color.get("r", 0), color.get("g", 0), color.get("b", 0))
+    return min(
+        _WAYPOINT_NAMED_SLOTS,
+        key=lambda n: sum(
+            (a - b) ** 2 for a, b in zip(MAP_PALETTE[_WAYPOINT_NAMED_SLOTS[n]].rgb, rgb)
+        ),
+    )
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
     client = BlueMapClient(BlueMapConfig.from_env())
@@ -168,7 +192,7 @@ def create_app() -> Flask:
                         "name": marker.get("label") or marker_id,
                         "x": pos["x"],
                         "z": pos["z"],
-                        "color": marker.get("lineColor") or marker.get("fillColor") or "yellow",
+                        "color": _marker_color(marker),
                         "source": "bluemap",
                     })
         return out
