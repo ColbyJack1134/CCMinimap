@@ -993,7 +993,10 @@ local NAMED_HEX = {
   brown="c", orange="e", black="f",
 }
 local function paletteHexFor(name)
-  return NAMED_HEX[(name or ""):lower()] or "1"
+  -- Type guard, not just nil guard: a non-string color (e.g. an {r,g,b,a}
+  -- table from a raw BlueMap marker) would crash on :lower().
+  if type(name) ~= "string" then return "1" end
+  return NAMED_HEX[name:lower()] or "1"
 end
 local HEX_TO_COLOR = {
   ["0"]=colors.white,    ["1"]=colors.orange,    ["2"]=colors.magenta,
@@ -3031,8 +3034,21 @@ state._commitTap = function()
   state.pendingMapTap  = nil
   state.pendingTapTimer = nil
   if not tap then return end
-  if state.screen == "map" and state.pinArmed
-     and state.lastPos and state.hasMap and tap.y <= mapHeight() then
+  if state.screen ~= "map" or not state.lastPos or not state.hasMap or tap.y > mapHeight() then return end
+  -- A confirmed tap (no drag step cancelled it) selects the marker under it,
+  -- like the pre-pan flow did. handleTouch can't: the first monitor_touch of
+  -- a gesture returns before its hitbox loop to disambiguate tap vs drag.
+  for _, t in ipairs(state.targetCells or {}) do
+    if tap.y == t.row and tap.x >= t.col1 and tap.x <= t.col2 and not t.cmd then
+      state._cancelPinHold()
+      dispatchCommand({
+        cmd = "set_target",
+        target = { kind = t.kind, name = t.name, x = t.x, z = t.z, color = t.color },
+      })
+      return
+    end
+  end
+  if state.pinArmed then
     state._placePinAt(tap.x, tap.y, true)
   end
 end
